@@ -64,6 +64,34 @@ _TEXT_CONTENT_TYPES = (
     "application/x-www-form-urlencoded",
 )
 
+# Headers that must be redacted before sending to governance API
+_SENSITIVE_HEADERS = frozenset({
+    "authorization", "cookie", "set-cookie", "x-api-key",
+    "x-auth-token", "proxy-authorization", "www-authenticate",
+})
+
+# Max body size sent to governance API (bytes of string repr)
+_MAX_BODY_CAPTURE = 8192
+
+
+def _sanitize_headers(headers: dict | None) -> dict | None:
+    """Redact sensitive headers (auth tokens, cookies) before governance."""
+    if not headers:
+        return headers
+    return {
+        k: "[REDACTED]" if k.lower() in _SENSITIVE_HEADERS else v
+        for k, v in headers.items()
+    }
+
+
+def _truncate_body(body: str | None) -> str | None:
+    """Truncate body to _MAX_BODY_CAPTURE to prevent oversized payloads."""
+    if body is None:
+        return None
+    if len(body) > _MAX_BODY_CAPTURE:
+        return body[:_MAX_BODY_CAPTURE] + "...[truncated]"
+    return body
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shared HTTP utilities
@@ -136,10 +164,10 @@ def _build_http_span_data(
         # HTTP-specific root fields
         "http_method": http_method,
         "http_url": http_url,
-        "request_body": request_body,
-        "request_headers": request_headers,
-        "response_body": response_body,
-        "response_headers": response_headers,
+        "request_body": _truncate_body(request_body),
+        "request_headers": _sanitize_headers(request_headers),
+        "response_body": _truncate_body(response_body),
+        "response_headers": _sanitize_headers(response_headers),
         "http_status_code": http_status_code,
         "error": error,
     }

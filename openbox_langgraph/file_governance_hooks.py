@@ -72,8 +72,14 @@ def _build_file_span_data(
     }
 
     # Only include optional fields if they have values
+    # Truncate file content to prevent oversized governance payloads
+    _MAX_FILE_DATA = 4096
     if data is not None:
-        result["data"] = data
+        data_str = str(data)
+        if len(data_str) > _MAX_FILE_DATA:
+            result["data"] = data_str[:_MAX_FILE_DATA] + "...[truncated]"
+        else:
+            result["data"] = data_str
     if bytes_read is not None:
         result["bytes_read"] = bytes_read
     if bytes_written is not None:

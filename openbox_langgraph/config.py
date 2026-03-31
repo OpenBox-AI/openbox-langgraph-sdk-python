@@ -250,9 +250,12 @@ def initialize(
     validate_url_security(api_url)
 
     if not validate_api_key_format(api_key):
+        # Show only the structural prefix, never actual secret chars
+        parts = api_key.split("_", 2)
+        prefix_hint = "_".join(parts[:2]) + "_..." if len(parts) >= 2 else "???"
         msg = (
             f"Invalid API key format. Expected 'obx_live_*' or 'obx_test_*', "
-            f"got: '{api_key[:15]}...' (showing first 15 chars)"
+            f"got prefix: '{prefix_hint}'"
         )
         raise OpenBoxAuthError(msg)
 
