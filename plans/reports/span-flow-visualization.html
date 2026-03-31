@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OpenBox LangGraph SDK — Span & OTel Flow</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: #0a0e17; color: #e0e6ed; padding: 40px; }
+  h1 { color: #7eb8ff; font-size: 22px; margin-bottom: 4px; }
+  h2 { color: #7eb8ff; font-size: 16px; margin: 40px 0 16px; }
+  .subtitle { color: #6b7a8d; font-size: 13px; margin-bottom: 32px; }
+  .section { margin: 32px 0; }
+
+  /* SVG Graph Styles */
+  svg { display: block; margin: 0 auto; }
+  .node rect, .node ellipse { stroke-width: 2; rx: 8; ry: 8; }
+  .node text { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; fill: #e0e6ed; }
+  .node-label { font-size: 10px; fill: #8b9ab0; }
+  .edge line, .edge path { stroke-width: 1.5; fill: none; }
+  .edge polygon { stroke-width: 1; }
+  .edge-label { font-family: 'SF Mono', monospace; font-size: 9px; fill: #6b7a8d; }
+
+  /* Color Palette */
+  .fill-lg { fill: #1a2040; stroke: #4a5a80; }
+  .fill-handler { fill: #0d2844; stroke: #2d6ab4; }
+  .fill-sp { fill: #0d2a1a; stroke: #2da060; }
+  .fill-sc { fill: #1f0d2a; stroke: #8a4abf; }
+  .fill-otel { fill: #2a2210; stroke: #b89030; }
+  .fill-hook { fill: #2a1018; stroke: #d04060; }
+  .fill-core { fill: #0a2a2a; stroke: #20c060; }
+  .fill-skip { fill: #1a1a1a; stroke: #404040; opacity: 0.5; }
+  .fill-decision { fill: #1a1a30; stroke: #6070b0; }
+
+  .stroke-lg { stroke: #4a5a80; }
+  .stroke-handler { stroke: #2d6ab4; }
+  .stroke-sp { stroke: #2da060; }
+  .stroke-sc { stroke: #8a4abf; }
+  .stroke-otel { stroke: #b89030; }
+  .stroke-hook { stroke: #d04060; }
+  .stroke-core { stroke: #20c060; }
+  .stroke-skip { stroke: #404040; stroke-dasharray: 5,5; }
+
+  .text-event { fill: #ffa060; }
+  .text-fn { fill: #c8a0ff; }
+  .text-var { fill: #70e090; }
+  .text-warn { fill: #ff5070; }
+  .text-dim { fill: #505a68; }
+  .text-white { fill: #e0e6ed; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 20px 0; padding: 12px 16px; background: #10151f; border-radius: 8px; border: 1px solid #1a2030; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8b9ab0; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid; }
+
+  .tab-bar { display: flex; gap: 4px; margin-bottom: 0; }
+  .tab { padding: 8px 20px; background: #10151f; border: 1px solid #1a2030; border-bottom: none; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 13px; color: #6b7a8d; transition: all 0.2s; }
+  .tab.active { background: #141a28; color: #7eb8ff; border-color: #2d6ab4; }
+  .tab:hover:not(.active) { color: #a0b0c0; }
+  .tab-content { display: none; padding: 24px; background: #141a28; border: 1px solid #1a2030; border-radius: 0 8px 8px 8px; }
+  .tab-content.active { display: block; }
+</style>
+</head>
+<body>
+
+<h1>OpenBox LangGraph SDK — Span & OTel Flow</h1>
+<p class="subtitle">Interactive visualization of governance event flow</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="border-color:#4a5a80; background:#1a2040"></div> LangGraph</div>
+  <div class="legend-item"><div class="legend-dot" style="border-color:#2d6ab4; background:#0d2844"></div> Handler</div>
+  <div class="legend-item"><div class="legend-dot" style="border-color:#2da060; background:#0d2a1a"></div> SpanProcessor</div>
+  <div class="legend-item"><div class="legend-dot" style="border-color:#8a4abf; background:#1f0d2a"></div> SpanCollector</div>
+  <div class="legend-item"><div class="legend-dot" style="border-color:#b89030; background:#2a2210"></div> OTel / HTTP hooks</div>
+  <div class="legend-item"><div class="legend-dot" style="border-color:#d04060; background:#2a1018"></div> hook_governance</div>
+  <div class="legend-item"><div class="legend-dot" style="border-color:#20c060; background:#0a2a2a"></div> OpenBox Core</div>
+</div>
+
+<div class="tab-bar">
+  <div class="tab active" onclick="showTab(0)">Regular Tool</div>
+  <div class="tab" onclick="showTab(1)">Subagent (task)</div>
+  <div class="tab" onclick="showTab(2)">LLM Call</div>
+  <div class="tab" onclick="showTab(3)">Architecture</div>
+</div>
+
+<!-- TAB 0: Regular Tool -->
+<div class="tab-content active" id="tab0">
+<svg viewBox="0 0 900 1100" width="900" height="1100">
+  <!-- Phase A Header -->
+  <text x="20" y="30" font-size="14" font-weight="bold" fill="#7eb8ff">Phase A: on_tool_start</text>
+
+  <!-- LangGraph fires event -->
+  <rect x="250" y="50" width="400" height="36" class="fill-lg" rx="6"/>
+  <text x="450" y="72" text-anchor="middle" class="text-event" font-size="12">on_tool_start("search_web")</text>
+
+  <line x1="450" y1="86" x2="450" y2="106" class="stroke-handler" stroke-width="2" marker-end="url(#arrow-handler)"/>
+
+  <!-- Handler: _map_event -->
+  <rect x="250" y="106" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="128" text-anchor="middle" font-size="11"><tspan class="text-fn">_map_event()</tspan><tspan class="text-white"> → ToolStarted</tspan></text>
+
+  <!-- Fork to SpanCollector and SpanProcessor -->
+  <line x1="350" y1="142" x2="350" y2="162" class="stroke-sc" stroke-width="2"/>
+  <line x1="550" y1="142" x2="550" y2="162" class="stroke-sp" stroke-width="2"/>
+
+  <rect x="150" y="162" width="260" height="36" class="fill-sc" rx="6"/>
+  <text x="280" y="184" text-anchor="middle" font-size="11"><tspan class="text-fn">activate_span_collector()</tspan></text>
+
+  <rect x="490" y="162" width="260" height="36" class="fill-sp" rx="6"/>
+  <text x="620" y="184" text-anchor="middle" font-size="11"><tspan class="text-fn">set_activity_context()</tspan></text>
+
+  <line x1="620" y1="198" x2="620" y2="218" class="stroke-sp" stroke-width="2"/>
+  <rect x="490" y="218" width="260" height="36" class="fill-sp" rx="6"/>
+  <text x="620" y="240" text-anchor="middle" font-size="11"><tspan class="text-fn">register_trace</tspan><tspan class="text-dim">(trace_id→activity)</tspan></text>
+
+  <!-- Merge back to handler -->
+  <line x1="350" y1="198" x2="350" y2="274" class="stroke-handler" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <line x1="620" y1="254" x2="620" y2="274" class="stroke-handler" stroke-width="1.5" stroke-dasharray="4,4"/>
+
+  <!-- Send to Core -->
+  <rect x="250" y="274" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="296" text-anchor="middle" font-size="11"><tspan class="text-fn">evaluate_event()</tspan><tspan class="text-white"> → send ToolStarted</tspan></text>
+
+  <line x1="450" y1="310" x2="450" y2="330" class="stroke-core" stroke-width="2" marker-end="url(#arrow-core)"/>
+
+  <rect x="300" y="330" width="300" height="36" class="fill-core" rx="6"/>
+  <text x="450" y="352" text-anchor="middle" font-size="11" fill="#70e090">Core: ActivityStarted → verdict</text>
+
+  <line x1="450" y1="366" x2="450" y2="386" class="stroke-handler" stroke-width="2"/>
+
+  <rect x="250" y="386" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="408" text-anchor="middle" font-size="11"><tspan class="text-fn">mark_activity_started()</tspan><tspan class="text-dim"> + internal span "started"</tspan></text>
+
+  <!-- Phase B Header -->
+  <text x="20" y="450" font-size="14" font-weight="bold" fill="#7eb8ff">Phase B: Tool executes httpx call</text>
+
+  <rect x="250" y="466" width="400" height="36" class="fill-lg" rx="6"/>
+  <text x="450" y="488" text-anchor="middle" font-size="12">search_web() → httpx.get("https://wikipedia.org")</text>
+
+  <!-- Two paths -->
+  <line x1="350" y1="502" x2="350" y2="530" class="stroke-otel" stroke-width="2"/>
+  <line x1="550" y1="502" x2="550" y2="530" class="stroke-otel" stroke-width="2"/>
+
+  <!-- Path 1: OTel hook -->
+  <rect x="100" y="530" width="320" height="52" class="fill-otel" rx="6"/>
+  <text x="260" y="550" text-anchor="middle" font-size="10" fill="#b89030" font-weight="bold">Path 1: OTel Request Hook</text>
+  <text x="260" y="570" text-anchor="middle" font-size="10"><tspan class="text-fn">_httpx_async_request_hook</tspan></text>
+
+  <line x1="260" y1="582" x2="260" y2="602" class="stroke-otel" stroke-width="1.5"/>
+
+  <rect x="130" y="602" width="260" height="30" class="fill-otel" rx="6"/>
+  <text x="260" y="621" text-anchor="middle" font-size="10">store span + governance <tspan class="text-event">"started"</tspan></text>
+
+  <line x1="260" y1="632" x2="260" y2="652" class="stroke-hook" stroke-width="1.5"/>
+
+  <rect x="110" y="652" width="300" height="36" class="fill-hook" rx="6"/>
+  <text x="260" y="668" text-anchor="middle" font-size="10"><tspan class="text-fn">evaluate_async()</tspan><tspan class="text-white"> → _build_payload()</tspan></text>
+  <text x="260" y="680" text-anchor="middle" font-size="9" class="text-dim">SpanProcessor.get_activity_context_by_trace()</text>
+
+  <line x1="260" y1="688" x2="450" y2="730" class="stroke-core" stroke-width="1.5"/>
+
+  <!-- Path 2: Patched send -->
+  <rect x="480" y="530" width="320" height="52" class="fill-otel" rx="6"/>
+  <text x="640" y="550" text-anchor="middle" font-size="10" fill="#b89030" font-weight="bold">Path 2: Patched AsyncClient.send</text>
+  <text x="640" y="570" text-anchor="middle" font-size="10"><tspan class="text-fn">_patched_async_send</tspan></text>
+
+  <line x1="640" y1="582" x2="640" y2="602" class="stroke-otel" stroke-width="1.5"/>
+
+  <rect x="490" y="602" width="300" height="30" class="fill-otel" rx="6"/>
+  <text x="640" y="621" text-anchor="middle" font-size="10">execute + capture body + <tspan class="text-event">"completed"</tspan></text>
+
+  <line x1="640" y1="632" x2="640" y2="652" class="stroke-hook" stroke-width="1.5"/>
+
+  <rect x="490" y="652" width="300" height="36" class="fill-hook" rx="6"/>
+  <text x="640" y="668" text-anchor="middle" font-size="10"><tspan class="text-fn">evaluate_async()</tspan><tspan class="text-white"> → completed</tspan></text>
+  <text x="640" y="680" text-anchor="middle" font-size="9" class="text-dim">with request_body + response_body</text>
+
+  <line x1="640" y1="688" x2="450" y2="730" class="stroke-core" stroke-width="1.5"/>
+
+  <!-- Core receives -->
+  <rect x="300" y="730" width="300" height="36" class="fill-core" rx="6"/>
+  <text x="450" y="752" text-anchor="middle" font-size="11" fill="#70e090">Core: hook_trigger=true → policy eval</text>
+
+  <!-- Phase C Header -->
+  <text x="20" y="800" font-size="14" font-weight="bold" fill="#7eb8ff">Phase C: on_tool_end</text>
+
+  <rect x="250" y="816" width="400" height="36" class="fill-lg" rx="6"/>
+  <text x="450" y="838" text-anchor="middle" class="text-event" font-size="12">on_tool_end("search_web")</text>
+
+  <line x1="350" y1="852" x2="350" y2="872" class="stroke-sc" stroke-width="2"/>
+  <line x1="550" y1="852" x2="550" y2="872" class="stroke-sp" stroke-width="2"/>
+
+  <rect x="150" y="872" width="260" height="30" class="fill-sc" rx="6"/>
+  <text x="280" y="891" text-anchor="middle" font-size="11"><tspan class="text-fn">drain_spans()</tspan></text>
+
+  <rect x="490" y="872" width="260" height="30" class="fill-sp" rx="6"/>
+  <text x="620" y="891" text-anchor="middle" font-size="11"><tspan class="text-fn">clear_activity_context()</tspan></text>
+
+  <line x1="450" y1="902" x2="450" y2="930" class="stroke-handler" stroke-width="2"/>
+
+  <rect x="250" y="930" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="952" text-anchor="middle" font-size="11"><tspan class="text-fn">internal span "completed"</tspan><tspan class="text-white"> + send ToolCompleted</tspan></text>
+
+  <line x1="450" y1="966" x2="450" y2="990" class="stroke-core" stroke-width="2" marker-end="url(#arrow-core)"/>
+
+  <rect x="300" y="990" width="300" height="36" class="fill-core" rx="6"/>
+  <text x="450" y="1012" text-anchor="middle" font-size="11" fill="#70e090">Core: ActivityCompleted → close row</text>
+
+  <!-- Arrow markers -->
+  <defs>
+    <marker id="arrow-handler" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2d6ab4"/>
+    </marker>
+    <marker id="arrow-core" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#20c060"/>
+    </marker>
+    <marker id="arrow-sp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2da060"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<!-- TAB 1: Subagent -->
+<div class="tab-content" id="tab1">
+<svg viewBox="0 0 900 750" width="900" height="750">
+  <text x="20" y="30" font-size="14" font-weight="bold" fill="#7eb8ff">Subagent: on_tool_start("task", subagent_type="researcher")</text>
+
+  <rect x="250" y="50" width="400" height="36" class="fill-lg" rx="6"/>
+  <text x="450" y="72" text-anchor="middle" class="text-event" font-size="12">on_tool_start("task")</text>
+
+  <line x1="450" y1="86" x2="450" y2="110" class="stroke-handler" stroke-width="2"/>
+
+  <!-- Decision diamond -->
+  <polygon points="450,110 530,145 450,180 370,145" class="fill-decision" stroke-width="2"/>
+  <text x="450" y="148" text-anchor="middle" font-size="10" fill="#a0b0ff">is_subagent?</text>
+
+  <!-- YES path -->
+  <line x1="530" y1="145" x2="620" y2="145" stroke="#ff5070" stroke-width="2"/>
+  <text x="565" y="138" font-size="10" fill="#ff5070">YES</text>
+
+  <rect x="620" y="128" width="200" height="36" class="fill-skip" rx="6"/>
+  <text x="720" y="150" text-anchor="middle" font-size="10" class="text-warn">SKIP all span setup</text>
+
+  <!-- Skipped items -->
+  <line x1="720" y1="164" x2="720" y2="190" stroke="#404040" stroke-width="1" stroke-dasharray="4,4"/>
+  <rect x="600" y="190" width="240" height="26" class="fill-skip" rx="4"/>
+  <text x="720" y="207" text-anchor="middle" font-size="9" class="text-dim" text-decoration="line-through">activate_span_collector — SKIP</text>
+  <rect x="600" y="222" width="240" height="26" class="fill-skip" rx="4"/>
+  <text x="720" y="239" text-anchor="middle" font-size="9" class="text-dim" text-decoration="line-through">set_activity_context — SKIP</text>
+  <rect x="600" y="254" width="240" height="26" class="fill-skip" rx="4"/>
+  <text x="720" y="271" text-anchor="middle" font-size="9" class="text-dim" text-decoration="line-through">register_trace — SKIP</text>
+  <rect x="600" y="286" width="240" height="26" class="fill-skip" rx="4"/>
+  <text x="720" y="303" text-anchor="middle" font-size="9" class="text-dim" text-decoration="line-through">mark_activity_started — SKIP</text>
+  <rect x="600" y="318" width="240" height="26" class="fill-skip" rx="4"/>
+  <text x="720" y="335" text-anchor="middle" font-size="9" class="text-dim" text-decoration="line-through">internal span hooks — SKIP</text>
+
+  <!-- Event-level governance still happens -->
+  <line x1="450" y1="180" x2="450" y2="370" class="stroke-handler" stroke-width="2"/>
+
+  <rect x="250" y="370" width="400" height="50" class="fill-handler" rx="6"/>
+  <text x="450" y="392" text-anchor="middle" font-size="11"><tspan class="text-white">Event-level governance: ToolStarted</tspan></text>
+  <text x="450" y="408" text-anchor="middle" font-size="10"><tspan class="text-var">__openbox: {subagent_name: "researcher", tool_type: "a2a"}</tspan></text>
+
+  <line x1="450" y1="420" x2="450" y2="444" class="stroke-core" stroke-width="2" marker-end="url(#arrow-core2)"/>
+
+  <rect x="300" y="444" width="300" height="36" class="fill-core" rx="6"/>
+  <text x="450" y="466" text-anchor="middle" font-size="11" fill="#70e090">Core: Rego policy checks subagent_name</text>
+
+  <!-- Subagent internal execution -->
+  <text x="20" y="510" font-size="14" font-weight="bold" fill="#7eb8ff">Subagent executes internally (invisible)</text>
+
+  <rect x="150" y="530" width="600" height="80" rx="8" fill="none" stroke="#303040" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="450" y="555" text-anchor="middle" font-size="11" class="text-dim">subagent.invoke() → new LangGraph graph → new asyncio.Tasks</text>
+  <text x="450" y="575" text-anchor="middle" font-size="11" class="text-dim">Internal HTTP calls get new trace_ids → SpanProcessor has no context</text>
+  <text x="450" y="595" text-anchor="middle" font-size="10" class="text-warn">→ spans silently dropped (correct behavior)</text>
+
+  <!-- on_tool_end -->
+  <text x="20" y="640" font-size="14" font-weight="bold" fill="#7eb8ff">on_tool_end("task")</text>
+
+  <rect x="250" y="660" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="682" text-anchor="middle" font-size="11"><tspan class="text-white">Event-level only: send ToolCompleted</tspan></text>
+
+  <line x1="450" y1="696" x2="450" y2="716" class="stroke-core" stroke-width="2" marker-end="url(#arrow-core2)"/>
+
+  <rect x="300" y="716" width="300" height="36" class="fill-core" rx="6"/>
+  <text x="450" y="738" text-anchor="middle" font-size="11" fill="#70e090">Core: ActivityCompleted → close row</text>
+
+  <defs>
+    <marker id="arrow-core2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#20c060"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<!-- TAB 2: LLM Call -->
+<div class="tab-content" id="tab2">
+<svg viewBox="0 0 900 620" width="900" height="620">
+  <text x="20" y="30" font-size="14" font-weight="bold" fill="#7eb8ff">LLM Call: on_chat_model_start / end</text>
+
+  <rect x="250" y="50" width="400" height="36" class="fill-lg" rx="6"/>
+  <text x="450" y="72" text-anchor="middle" class="text-event" font-size="12">on_chat_model_start("ChatOpenAI")</text>
+
+  <line x1="450" y1="86" x2="450" y2="110" class="stroke-handler" stroke-width="2"/>
+
+  <rect x="200" y="110" width="500" height="50" class="fill-handler" rx="6"/>
+  <text x="450" y="132" text-anchor="middle" font-size="11"><tspan class="text-fn">_GuardrailsCallbackHandler.on_chat_model_start()</tspan></text>
+  <text x="450" y="148" text-anchor="middle" font-size="10"><tspan class="text-dim">Fires BEFORE LLM call — extracts user prompt</tspan></text>
+
+  <line x1="450" y1="160" x2="450" y2="184" class="stroke-handler" stroke-width="2"/>
+
+  <rect x="250" y="184" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="206" text-anchor="middle" font-size="11"><tspan class="text-white">Send </tspan><tspan class="text-event">LLMStarted</tspan><tspan class="text-white"> (activity_type="</tspan><tspan class="text-var">llm_call</tspan><tspan class="text-white">")</tspan></text>
+
+  <line x1="450" y1="220" x2="450" y2="244" class="stroke-core" stroke-width="2"/>
+
+  <rect x="250" y="244" width="400" height="50" class="fill-core" rx="6"/>
+  <text x="450" y="266" text-anchor="middle" font-size="11" fill="#70e090">Core: Run guardrails (PII, content filter, toxicity)</text>
+  <text x="450" y="282" text-anchor="middle" font-size="10" fill="#70c070">→ return redacted_input if PII detected</text>
+
+  <line x1="450" y1="294" x2="450" y2="318" class="stroke-handler" stroke-width="2"/>
+
+  <rect x="250" y="318" width="400" height="36" class="fill-handler" rx="6"/>
+  <text x="450" y="340" text-anchor="middle" font-size="11"><tspan class="text-fn">Mutate messages in-place</tspan><tspan class="text-dim"> (PII redaction)</tspan></text>
+
+  <!-- LLM HTTP call -->
+  <line x1="450" y1="354" x2="450" y2="386" class="stroke-lg" stroke-width="2"/>
+
+  <rect x="200" y="386" width="500" height="50" class="fill-lg" rx="6"/>
+  <text x="450" y="408" text-anchor="middle" font-size="12">LLM calls api.openai.com / api.anthropic.com</text>
+  <text x="450" y="424" text-anchor="middle" font-size="10" class="text-dim">httpx hook fires but URL is in _LLM_PROVIDER_PREFIXES</text>
+
+  <line x1="450" y1="436" x2="450" y2="456" class="stroke-otel" stroke-width="1.5"/>
+
+  <rect x="280" y="456" width="340" height="30" class="fill-skip" rx="6"/>
+  <text x="450" y="475" text-anchor="middle" font-size="11" class="text-warn">_should_ignore_url() → IGNORED</text>
+
+  <!-- on_chat_model_end -->
+  <line x1="450" y1="486" x2="450" y2="516" class="stroke-lg" stroke-width="2"/>
+
+  <rect x="250" y="516" width="400" height="36" class="fill-lg" rx="6"/>
+  <text x="450" y="538" text-anchor="middle" class="text-event" font-size="12">on_chat_model_end</text>
+
+  <line x1="450" y1="552" x2="450" y2="576" class="stroke-core" stroke-width="2"/>
+
+  <rect x="250" y="576" width="400" height="36" class="fill-core" rx="6"/>
+  <text x="450" y="598" text-anchor="middle" font-size="11" fill="#70e090">Core: LLMCompleted (tokens, model, completion)</text>
+</svg>
+</div>
+
+<!-- TAB 3: Architecture -->
+<div class="tab-content" id="tab3">
+<svg viewBox="0 0 900 700" width="900" height="700">
+  <!-- LangGraph Event Stream -->
+  <rect x="200" y="20" width="500" height="44" class="fill-lg" rx="8"/>
+  <text x="450" y="46" text-anchor="middle" font-size="13" fill="#8090b0" font-weight="bold">LangGraph Event Stream</text>
+
+  <!-- Handler -->
+  <line x1="450" y1="64" x2="450" y2="90" class="stroke-handler" stroke-width="2" marker-end="url(#arrow-arch)"/>
+  <rect x="150" y="90" width="600" height="80" class="fill-handler" rx="8"/>
+  <text x="450" y="115" text-anchor="middle" font-size="13" fill="#5090d0" font-weight="bold">langgraph_handler.py</text>
+  <text x="250" y="138" font-size="10" class="text-fn">_map_event()</text>
+  <text x="400" y="138" font-size="10" class="text-fn">_process_event()</text>
+  <text x="570" y="138" font-size="10" class="text-fn">_pre_screen_input()</text>
+  <text x="250" y="155" font-size="10" class="text-fn">_GuardrailsCallback</text>
+  <text x="430" y="155" font-size="10" class="text-dim">subagent bypass</text>
+  <text x="590" y="155" font-size="10" class="text-dim">verdict enforcement</text>
+
+  <!-- Three outputs from handler -->
+  <line x1="250" y1="170" x2="150" y2="220" class="stroke-sc" stroke-width="2"/>
+  <line x1="450" y1="170" x2="450" y2="220" class="stroke-core" stroke-width="2" marker-end="url(#arrow-arch-core)"/>
+  <line x1="650" y1="170" x2="750" y2="220" class="stroke-sp" stroke-width="2"/>
+
+  <!-- SpanCollector -->
+  <rect x="30" y="220" width="240" height="70" class="fill-sc" rx="8"/>
+  <text x="150" y="245" text-anchor="middle" font-size="12" fill="#a070d0" font-weight="bold">SpanCollector</text>
+  <text x="150" y="262" text-anchor="middle" font-size="10" class="text-dim">per-tool instance</text>
+  <text x="150" y="278" text-anchor="middle" font-size="10" class="text-fn">ContextVar-based lookup</text>
+
+  <!-- Core -->
+  <rect x="320" y="220" width="260" height="70" class="fill-core" rx="8"/>
+  <text x="450" y="245" text-anchor="middle" font-size="12" fill="#40d080" font-weight="bold">OpenBox Core</text>
+  <text x="450" y="262" text-anchor="middle" font-size="10" class="text-dim">/api/v1/governance/evaluate</text>
+  <text x="450" y="278" text-anchor="middle" font-size="10" class="text-dim">Rego policy + guardrails + HITL</text>
+
+  <!-- SpanProcessor -->
+  <rect x="630" y="220" width="240" height="70" class="fill-sp" rx="8"/>
+  <text x="750" y="245" text-anchor="middle" font-size="12" fill="#50c070" font-weight="bold">SpanProcessor</text>
+  <text x="750" y="262" text-anchor="middle" font-size="10" class="text-dim">singleton (OTel interface)</text>
+  <text x="750" y="278" text-anchor="middle" font-size="10" class="text-fn">trace_id → activity map</text>
+
+  <!-- SpanProcessor to hook_governance -->
+  <line x1="750" y1="290" x2="750" y2="340" class="stroke-sp" stroke-width="2"/>
+
+  <!-- hook_governance -->
+  <rect x="580" y="340" width="280" height="60" class="fill-hook" rx="8"/>
+  <text x="720" y="365" text-anchor="middle" font-size="12" fill="#e05070" font-weight="bold">hook_governance.py</text>
+  <text x="720" y="382" text-anchor="middle" font-size="10" class="text-fn">evaluate_sync() / evaluate_async()</text>
+
+  <!-- hook_governance to Core -->
+  <line x1="580" y1="370" x2="500" y2="290" class="stroke-core" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <text x="530" y="325" font-size="9" fill="#6b7a8d" transform="rotate(-30 530 325)">hook_trigger=true</text>
+
+  <!-- OTel layer -->
+  <line x1="720" y1="400" x2="720" y2="430" class="stroke-otel" stroke-width="2"/>
+
+  <rect x="50" y="430" width="820" height="240" fill="none" stroke="#303040" stroke-width="1" rx="8" stroke-dasharray="4,4"/>
+  <text x="450" y="455" text-anchor="middle" font-size="13" fill="#b89030" font-weight="bold">OTel Instrumentation Layer</text>
+
+  <!-- HTTP hooks -->
+  <rect x="80" y="470" width="240" height="60" class="fill-otel" rx="6"/>
+  <text x="200" y="495" text-anchor="middle" font-size="11" fill="#d0a040" font-weight="bold">http_governance_hooks</text>
+  <text x="200" y="512" text-anchor="middle" font-size="9" class="text-dim">requests | httpx | urllib3 | urllib</text>
+
+  <!-- DB hooks -->
+  <rect x="340" y="470" width="240" height="60" class="fill-otel" rx="6"/>
+  <text x="460" y="495" text-anchor="middle" font-size="11" fill="#d0a040" font-weight="bold">db_governance_hooks</text>
+  <text x="460" y="512" text-anchor="middle" font-size="9" class="text-dim">psycopg2 | asyncpg | mongo | redis | SA</text>
+
+  <!-- File hooks -->
+  <rect x="600" y="470" width="240" height="60" class="fill-otel" rx="6"/>
+  <text x="720" y="495" text-anchor="middle" font-size="11" fill="#d0a040" font-weight="bold">file_governance_hooks</text>
+  <text x="720" y="512" text-anchor="middle" font-size="9" class="text-dim">builtins.open() patch</text>
+
+  <!-- otel_setup -->
+  <rect x="200" y="560" width="500" height="44" class="fill-otel" rx="6"/>
+  <text x="450" y="586" text-anchor="middle" font-size="11" fill="#d0a040" font-weight="bold">otel_setup.py — orchestrates all instrumentors</text>
+
+  <!-- tracing -->
+  <rect x="200" y="620" width="500" height="36" class="fill-otel" rx="6"/>
+  <text x="450" y="642" text-anchor="middle" font-size="11"><tspan fill="#d0a040" font-weight="bold">tracing.py</tspan><tspan class="text-dim"> — @traced decorator for internal function spans</tspan></text>
+
+  <!-- Connect hooks to hook_governance -->
+  <line x1="200" y1="470" x2="620" y2="400" class="stroke-hook" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="460" y1="470" x2="680" y2="400" class="stroke-hook" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="720" y1="470" x2="720" y2="400" class="stroke-hook" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <defs>
+    <marker id="arrow-arch" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2d6ab4"/>
+    </marker>
+    <marker id="arrow-arch-core" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#20c060"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<script>
+function showTab(idx) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', i===idx));
+  document.querySelectorAll('.tab-content').forEach((c,i) => c.classList.toggle('active', i===idx));
+}
+</script>
+
+</body>
+</html>
