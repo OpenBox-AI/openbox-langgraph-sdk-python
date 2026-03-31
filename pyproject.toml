@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openbox-langgraph-sdk-python"
-version = "0.1.1"
+version = "0.1.2"
 description = "OpenBox governance and observability SDK for LangGraph"
 readme = "README.md"
 license = { text = "MIT" }
