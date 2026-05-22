@@ -32,11 +32,19 @@ from openbox_langgraph.errors import (
     GovernanceHaltError,
     GuardrailsValidationError,
     OpenBoxAuthError,
+    OpenBoxConfigError,
     OpenBoxError,
     OpenBoxInsecureURLError,
     OpenBoxNetworkError,
 )
 from openbox_langgraph.hitl import poll_until_decision
+from openbox_langgraph.identity import (
+    AgentIdentityConfig,
+    build_agent_identity_canonical_request,
+    create_agent_identity_headers,
+    parse_optional_agent_identity_config,
+    validate_agent_identity_config,
+)
 from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     OpenBoxLangGraphHandlerOptions,
@@ -79,6 +87,7 @@ from openbox_langgraph.verdict_handler import (
 
 __all__ = [
     "DEFAULT_HITL_CONFIG",
+    "AgentIdentityConfig",
     "ApprovalExpiredError",
     "ApprovalRejectedError",
     "ApprovalResponse",
@@ -95,6 +104,7 @@ __all__ = [
     "LangChainGovernanceEvent",
     "LangGraphStreamEvent",
     "OpenBoxAuthError",
+    "OpenBoxConfigError",
     "OpenBoxError",
     "OpenBoxInsecureURLError",
     "OpenBoxLangGraphHandler",
@@ -105,7 +115,9 @@ __all__ = [
     "WorkflowEventType",
     "WorkflowSpanBuffer",
     "WorkflowSpanProcessor",
+    "build_agent_identity_canonical_request",
     "build_auth_headers",
+    "create_agent_identity_headers",
     "create_openbox_graph_handler",
     "create_span",
     "enforce_verdict",
@@ -117,12 +129,14 @@ __all__ = [
     "merge_config",
     "parse_approval_response",
     "parse_governance_response",
+    "parse_optional_agent_identity_config",
     "poll_until_decision",
     "rfc3339_now",
     "safe_serialize",
     "setup_opentelemetry_for_governance",
     "to_server_event_type",
     "traced",
+    "validate_agent_identity_config",
     "verdict_from_string",
     "verdict_priority",
     "verdict_requires_approval",
