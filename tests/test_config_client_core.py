@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -109,10 +110,15 @@ def test_merge_config_normalizes_timeout_sets_and_hitl() -> None:
 
 
 def test_initialize_validates_and_stores_global_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, float]] = []
+    calls: list[tuple[str, str, float, Any]] = []
 
-    def _validate(api_url: str, api_key: str, timeout: float) -> None:
-        calls.append((api_url, api_key, timeout))
+    def _validate(
+        api_url: str,
+        api_key: str,
+        timeout: float,
+        agent_identity: Any,
+    ) -> None:
+        calls.append((api_url, api_key, timeout, agent_identity))
 
     monkeypatch.setattr(config_module, "_validate_api_key_with_server", _validate)
 
@@ -127,7 +133,7 @@ def test_initialize_validates_and_stores_global_config(monkeypatch: pytest.Monke
     assert global_config.api_url == "https://core.openbox.test"
     assert global_config.api_key == "obx_test_valid"
     assert global_config.governance_timeout == 12
-    assert calls == [("https://core.openbox.test", "obx_test_valid", 12)]
+    assert calls == [("https://core.openbox.test", "obx_test_valid", 12, None)]
 
 
 def test_initialize_rejects_invalid_api_key_without_server_call(
@@ -175,8 +181,9 @@ async def test_evaluate_event_maps_payload_and_deduplicates() -> None:
     assert result.verdict == Verdict.ALLOW
     assert duplicate is None
     assert len(stub.calls) == 1
-    assert stub.calls[0]["json"]["event_type"] == "ActivityStarted"
-    assert stub.calls[0]["json"]["source"] == "workflow-telemetry"
+    payload = json.loads(stub.calls[0]["content"].decode())
+    assert payload["event_type"] == "ActivityStarted"
+    assert payload["source"] == "workflow-telemetry"
 
 
 async def test_evaluate_event_fail_closed_raises_network_error() -> None:
