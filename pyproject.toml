@@ -53,6 +53,15 @@ packages = ["openbox_langgraph"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
+[tool.coverage.run]
+omit = [
+    "openbox_langgraph/db_governance_hooks.py",
+    "openbox_langgraph/file_governance_hooks.py",
+    "openbox_langgraph/http_governance_hooks.py",
+    "openbox_langgraph/otel_setup.py",
+    "openbox_langgraph/tracing.py",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
