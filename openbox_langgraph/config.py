@@ -7,28 +7,38 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openbox_langgraph.errors import (
     OpenBoxAuthError,
+    OpenBoxConfigError,
     OpenBoxInsecureURLError,
     OpenBoxNetworkError,
 )
+from openbox_langgraph.identity import (
+    AgentIdentityConfig,
+    parse_optional_agent_identity_config,
+)
 from openbox_langgraph.types import DEFAULT_HITL_CONFIG, HITLConfig
+
+if TYPE_CHECKING:
+    from logging import Logger
 
 # API key format pattern (obx_live_... or obx_test_...)
 _API_KEY_PATTERN = re.compile(r"^obx_(live|test)_[a-zA-Z0-9_]+$")
 
 
-def _get_logger():
+def _get_logger() -> Logger:
     """Lazy logger import."""
     import logging
+
     return logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
 # API key / URL validation
 # ═══════════════════════════════════════════════════════════════════
+
 
 def validate_api_key_format(api_key: str) -> bool:
     """Return True if the API key matches the expected `obx_live_*` / `obx_test_*` format."""
@@ -52,6 +62,7 @@ def validate_url_security(api_url: str) -> None:
 # ═══════════════════════════════════════════════════════════════════
 # GovernanceConfig
 # ═══════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class GovernanceConfig:
@@ -143,16 +154,27 @@ def merge_config(partial: dict[str, Any] | None = None) -> GovernanceConfig:
 # Global Config Singleton
 # ═══════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class _GlobalConfigState:
     api_url: str = ""
     api_key: str = ""
     governance_timeout: float = 30.0  # seconds
+    agent_did: str | None = None
+    agent_private_key: str | None = None
 
-    def configure(self, api_url: str, api_key: str, governance_timeout: float = 30.0) -> None:
+    def configure(
+        self,
+        api_url: str,
+        api_key: str,
+        governance_timeout: float = 30.0,
+        agent_identity: AgentIdentityConfig | None = None,
+    ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.governance_timeout = governance_timeout
+        self.agent_did = agent_identity.did if agent_identity else None
+        self.agent_private_key = agent_identity.private_key if agent_identity else None
 
     def __repr__(self) -> str:
         if self.api_key and len(self.api_key) > 8:
@@ -164,7 +186,8 @@ class _GlobalConfigState:
         return (
             f"_GlobalConfigState(api_url={self.api_url!r}, "
             f"api_key={masked!r}, "
-            f"governance_timeout={self.governance_timeout})"
+            f"governance_timeout={self.governance_timeout}, "
+            f"agent_did={self.agent_did!r})"
         )
 
     def is_configured(self) -> bool:
@@ -183,8 +206,12 @@ def get_global_config() -> _GlobalConfigState:
 # Server-side API key validation (sync, using urllib — no httpx at module level)
 # ═══════════════════════════════════════════════════════════════════
 
+
 def _validate_api_key_with_server(
-    api_url: str, api_key: str, timeout: float
+    api_url: str,
+    api_key: str,
+    timeout: float,
+    agent_identity: AgentIdentityConfig | None = None,
 ) -> None:
     """Validate API key by calling /api/v1/auth/validate endpoint (synchronous).
 
@@ -194,14 +221,18 @@ def _validate_api_key_with_server(
     from urllib.error import HTTPError, URLError  # lazy
     from urllib.request import Request, urlopen  # lazy
 
+    from openbox_langgraph.client import build_auth_headers  # lazy
+
     try:
         req = Request(
             f"{api_url}/api/v1/auth/validate",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "OpenBox-LangGraph-SDK/0.1.0",
-            },
+            headers=build_auth_headers(
+                api_key,
+                method="GET",
+                pathname="/api/v1/auth/validate",
+                body=b"",
+                agent_identity=agent_identity,
+            ),
             method="GET",
         )
         with urlopen(req, timeout=timeout) as response:
@@ -230,11 +261,14 @@ def _validate_api_key_with_server(
 # initialize() — synchronous, matching openbox-temporal-sdk-python
 # ═══════════════════════════════════════════════════════════════════
 
+
 def initialize(
     api_url: str,
     api_key: str,
     governance_timeout: float = 30.0,
     validate: bool = True,
+    agent_did: str | None = None,
+    agent_private_key: str | None = None,
 ) -> None:
     """Initialize the OpenBox LangGraph SDK with credentials.
 
@@ -246,7 +280,12 @@ def initialize(
         api_key: API key in `obx_live_*` or `obx_test_*` format.
         governance_timeout: HTTP timeout in **seconds** for governance calls (default 30.0).
         validate: If True, validates the API key against the server on startup.
+        agent_did: Optional OpenBox agent DID. Falls back to `OPENBOX_AGENT_DID`.
+        agent_private_key: Optional raw Ed25519 private key seed. Falls back to
+            `OPENBOX_AGENT_PRIVATE_KEY`.
     """
+    import os
+
     validate_url_security(api_url)
 
     if not validate_api_key_format(api_key):
@@ -259,9 +298,27 @@ def initialize(
         )
         raise OpenBoxAuthError(msg)
 
-    _global_config.configure(api_url.rstrip("/"), api_key, governance_timeout)
+    try:
+        agent_identity = parse_optional_agent_identity_config(
+            did=agent_did or os.environ.get("OPENBOX_AGENT_DID"),
+            private_key=agent_private_key or os.environ.get("OPENBOX_AGENT_PRIVATE_KEY"),
+        )
+    except OpenBoxConfigError:
+        raise
 
     if validate:
-        _validate_api_key_with_server(api_url.rstrip("/"), api_key, governance_timeout)
+        _validate_api_key_with_server(
+            api_url.rstrip("/"),
+            api_key,
+            governance_timeout,
+            agent_identity,
+        )
+
+    _global_config.configure(
+        api_url.rstrip("/"),
+        api_key,
+        governance_timeout,
+        agent_identity,
+    )
 
     _get_logger().info(f"OpenBox LangGraph SDK initialized with API URL: {api_url}")

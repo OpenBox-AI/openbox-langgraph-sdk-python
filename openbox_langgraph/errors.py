@@ -11,6 +11,10 @@ class OpenBoxAuthError(OpenBoxError):
     """Raised when the API key is invalid or unauthorized."""
 
 
+class OpenBoxConfigError(OpenBoxError):
+    """Raised when SDK configuration is invalid."""
+
+
 class OpenBoxNetworkError(OpenBoxError):
     """Raised when the OpenBox Core API is unreachable or returns an error."""
 

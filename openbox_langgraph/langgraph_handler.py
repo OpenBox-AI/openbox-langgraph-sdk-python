@@ -413,6 +413,8 @@ class OpenBoxLangGraphHandler:
                 api_key=gc.api_key,
                 timeout=gc.governance_timeout,  # seconds
                 on_api_error=self._config.on_api_error,
+                agent_did=gc.agent_did,
+                agent_private_key=gc.agent_private_key,
             )
 
         # Setup OTel HTTP governance hooks (required)
@@ -429,6 +431,8 @@ class OpenBoxLangGraphHandler:
                 api_timeout=gc.governance_timeout,
                 on_api_error=self._config.on_api_error,
                 sqlalchemy_engine=opts.sqlalchemy_engine,
+                agent_did=gc.agent_did,
+                agent_private_key=gc.agent_private_key,
             )
             _logger.debug("[OpenBox] OTel HTTP governance hooks enabled")
         else:
@@ -1451,6 +1455,8 @@ def create_openbox_graph_handler(
     validate: bool = True,
     enable_telemetry: bool = True,
     sqlalchemy_engine: Any = None,
+    agent_did: str | None = None,
+    agent_private_key: str | None = None,
     **handler_kwargs: Any,
 ) -> OpenBoxLangGraphHandler:
     """Create a fully configured `OpenBoxLangGraphHandler` wrapping a compiled LangGraph graph.
@@ -1467,6 +1473,9 @@ def create_openbox_graph_handler(
         enable_telemetry: Reserved for future HTTP-span telemetry patching.
         sqlalchemy_engine: Optional SQLAlchemy Engine instance to instrument for DB
             governance. Required when the engine is created before the handler.
+        agent_did: Optional OpenBox agent DID. Falls back to `OPENBOX_AGENT_DID`.
+        agent_private_key: Optional raw Ed25519 private key seed. Falls back to
+            `OPENBOX_AGENT_PRIVATE_KEY`.
         **handler_kwargs: Additional keyword arguments forwarded to
             `OpenBoxLangGraphHandlerOptions`.
 
@@ -1488,6 +1497,8 @@ def create_openbox_graph_handler(
         api_key=api_key,
         governance_timeout=governance_timeout,
         validate=validate,
+        agent_did=agent_did,
+        agent_private_key=agent_private_key,
     )
 
     options = OpenBoxLangGraphHandlerOptions(

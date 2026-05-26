@@ -67,6 +67,8 @@ def setup_opentelemetry_for_governance(
     sqlalchemy_engine: Any | None = None,
     api_timeout: float = 30.0,
     on_api_error: str = "fail_open",
+    agent_did: str | None = None,
+    agent_private_key: str | None = None,
 ) -> None:
     """
     Setup OpenTelemetry instrumentors with body capture hooks.
@@ -88,6 +90,8 @@ def setup_opentelemetry_for_governance(
                           when the engine is created before instrumentation runs (e.g.,
                           at module import time). If not provided, only future engines
                           created via create_engine() will be instrumented.
+        agent_did: Optional OpenBox agent DID for AIP request signing.
+        agent_private_key: Optional OpenBox agent private key for AIP request signing.
     """
     global _span_processor, _ignored_url_prefixes
     _span_processor = span_processor
@@ -99,8 +103,13 @@ def setup_opentelemetry_for_governance(
 
     # Configure governance modules
     _hook_gov.configure(
-        api_url, api_key, span_processor,
-        api_timeout=api_timeout, on_api_error=on_api_error,
+        api_url,
+        api_key,
+        span_processor,
+        api_timeout=api_timeout,
+        on_api_error=on_api_error,
+        agent_did=agent_did,
+        agent_private_key=agent_private_key,
     )
     _db_gov.configure(span_processor)
 

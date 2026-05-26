@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from .client import build_auth_headers
+from .identity import AgentIdentityConfig, parse_optional_agent_identity_config
 
 if TYPE_CHECKING:
     from .span_processor import WorkflowSpanProcessor
@@ -37,7 +38,7 @@ _api_key: str = ""
 _api_timeout: float = 30.0
 _on_api_error: str = FAIL_OPEN
 _span_processor: WorkflowSpanProcessor | None = None
-_cached_auth_headers: dict | None = None
+_agent_identity: AgentIdentityConfig | None = None
 
 # Persistent HTTP clients (lazy-init, thread-safe for requests)
 _sync_client: httpx.Client | None = None
@@ -51,6 +52,8 @@ def configure(
     *,
     api_timeout: float = 30.0,
     on_api_error: str = "fail_open",
+    agent_did: str | None = None,
+    agent_private_key: str | None = None,
 ) -> None:
     """Set governance config. Called once by setup_opentelemetry_for_governance().
 
@@ -60,16 +63,20 @@ def configure(
         span_processor: WorkflowSpanProcessor for activity context lookup
         api_timeout: Timeout for governance API calls (seconds)
         on_api_error: Error policy — "fail_open" or "fail_closed"
+        agent_did: Optional OpenBox agent DID for AIP request signing
+        agent_private_key: Optional OpenBox agent private key for AIP request signing
     """
     global _api_url, _api_key, _api_timeout, _on_api_error
-    global _span_processor, _sync_client, _async_client, _cached_auth_headers
+    global _span_processor, _sync_client, _async_client, _agent_identity
     _api_url = api_url.rstrip("/")
     _api_key = api_key
     _api_timeout = api_timeout
     _on_api_error = on_api_error
     _span_processor = span_processor
-    # Cache auth headers (immutable after configure)
-    _cached_auth_headers = build_auth_headers(api_key)
+    _agent_identity = parse_optional_agent_identity_config(
+        did=agent_did,
+        private_key=agent_private_key,
+    )
     # Reset persistent clients so they pick up new timeout/config
     _sync_client = None
     _async_client = None
@@ -138,9 +145,15 @@ def extract_span_context(span) -> tuple:
     return span_id, trace_id, parent_span_id
 
 
-def _auth_headers() -> dict:
-    """Return cached auth headers (built once in configure())."""
-    return _cached_auth_headers or build_auth_headers(_api_key)
+def _auth_headers(*, method: str, pathname: str, body: bytes | str | None) -> dict[str, str]:
+    """Build auth headers for the exact outbound governance request."""
+    return build_auth_headers(
+        _api_key,
+        method=method,
+        pathname=pathname,
+        body=body,
+        agent_identity=_agent_identity,
+    )
 
 
 def _build_payload(
@@ -332,10 +345,15 @@ def evaluate_sync(
 
     try:
         client = _get_sync_client()
+        body = _json_body(payload)
         response = client.post(
             f"{_api_url}/api/v1/governance/evaluate",
-            json=payload,
-            headers=_auth_headers(),
+            content=body,
+            headers=_auth_headers(
+                method="POST",
+                pathname="/api/v1/governance/evaluate",
+                body=body,
+            ),
         )
         _send_and_handle(response, identifier, span=span)
 
@@ -380,10 +398,15 @@ async def evaluate_async(
 
     try:
         client = _get_async_client()
+        body = _json_body(payload)
         response = await client.post(
             f"{_api_url}/api/v1/governance/evaluate",
-            json=payload,
-            headers=_auth_headers(),
+            content=body,
+            headers=_auth_headers(
+                method="POST",
+                pathname="/api/v1/governance/evaluate",
+                body=body,
+            ),
         )
         _send_and_handle(response, identifier, span=span)
 
@@ -395,3 +418,7 @@ async def evaluate_async(
             raise GovernanceBlockedError(
                 "halt", f"Governance evaluation error: {e}", identifier
             ) from e
+
+
+def _json_body(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
