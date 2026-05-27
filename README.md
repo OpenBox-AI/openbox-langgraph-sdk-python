@@ -91,15 +91,19 @@ uv add openbox-langgraph-sdk-python
 
 ## Quickstart
 
-### 1. Get your API key
+### 1. Get your agent credentials
 
-Sign in to [dashboard.openbox.ai](https://dashboard.openbox.ai), create an agent called `"MyAgent"`, and copy your API key (`obx_live_...` or `obx_test_...`).
+Sign in to [dashboard.openbox.ai](https://dashboard.openbox.ai), create an agent called `"MyAgent"`, and copy the agent API key plus its DID credentials.
+
+New OpenBox agents have DID signing enabled by default. Keep the private key secret and load it from your environment.
 
 ### 2. Set environment variables
 
 ```bash
 export OPENBOX_URL="https://core.openbox.ai"
 export OPENBOX_API_KEY="obx_live_..."
+export OPENBOX_AGENT_DID="did:aip:..."
+export OPENBOX_AGENT_PRIVATE_KEY="..."
 ```
 
 ### 3. Wrap your graph
@@ -158,6 +162,8 @@ See `test-agent/README.md` for setup and run instructions.
 | `graph` | `CompiledGraph` | **required** | Your compiled LangGraph graph |
 | `api_url` | `str` | **required** | Base URL of your OpenBox Core instance |
 | `api_key` | `str` | **required** | API key (`obx_live_*` or `obx_test_*`) |
+| `agent_did` | `str` | `OPENBOX_AGENT_DID` | Agent DID used to sign governance requests |
+| `agent_private_key` | `str` | `OPENBOX_AGENT_PRIVATE_KEY` | Base64 raw Ed25519 private key seed for the agent DID |
 | `agent_name` | `str` | `None` | Agent name as configured in the dashboard |
 | `validate` | `bool` | `True` | Validate API key against server on startup |
 | `on_api_error` | `str` | `"fail_open"` | `"fail_open"` (allow on error) or `"fail_closed"` (block on error) |

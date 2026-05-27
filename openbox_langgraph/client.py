@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC
@@ -9,7 +10,12 @@ from typing import Any
 
 import httpx
 
-from openbox_langgraph.errors import OpenBoxNetworkError
+from openbox_langgraph.errors import OpenBoxConfigError, OpenBoxNetworkError
+from openbox_langgraph.identity import (
+    AgentIdentityConfig,
+    create_agent_identity_headers,
+    parse_optional_agent_identity_config,
+)
 from openbox_langgraph.types import (
     ApprovalResponse,
     GovernanceVerdictResponse,
@@ -19,20 +25,41 @@ from openbox_langgraph.types import (
     to_server_event_type,
 )
 
-_SDK_VERSION = "0.1.0"
+_SDK_VERSION = "0.2.0"
 
 
-def build_auth_headers(api_key: str) -> dict[str, str]:
+def build_auth_headers(
+    api_key: str,
+    *,
+    method: str | None = None,
+    pathname: str | None = None,
+    body: bytes | str | None = None,
+    agent_identity: AgentIdentityConfig | None = None,
+) -> dict[str, str]:
     """Build standard auth headers for governance API calls.
 
     Single source of truth — used by GovernanceClient and hook_governance.
     """
-    return {
+    headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "User-Agent": f"OpenBox-LangGraph-SDK/{_SDK_VERSION}",
         "X-OpenBox-SDK-Version": _SDK_VERSION,
     }
+    if agent_identity:
+        if method is None or pathname is None:
+            msg = "method and pathname are required when signing OpenBox requests."
+            raise OpenBoxConfigError(msg)
+        headers.update(
+            create_agent_identity_headers(
+                did=agent_identity.did,
+                private_key=agent_identity.private_key,
+                method=method,
+                pathname=pathname,
+                body=body,
+            )
+        )
+    return headers
 
 
 @dataclass
@@ -58,6 +85,8 @@ class GovernanceClient:
         api_key: str,
         timeout: float = 30.0,  # seconds
         on_api_error: str = "fail_open",
+        agent_did: str | None = None,
+        agent_private_key: str | None = None,
     ) -> None:
         self._api_url = api_url.rstrip("/")
         self._api_key = api_key
@@ -65,7 +94,10 @@ class GovernanceClient:
         self._on_api_error = on_api_error
         self._client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
-        self._cached_headers = build_auth_headers(api_key)
+        self._agent_identity = parse_optional_agent_identity_config(
+            did=agent_did,
+            private_key=agent_private_key,
+        )
         # Deduplication: prevent sending the same (activity_id, event_type) twice
         # within the same workflow run. Keyed by (workflow_id, run_id) so it resets
         # automatically on each new ainvoke() call.
@@ -110,7 +142,11 @@ class GovernanceClient:
             client = self._get_client()
             response = await client.get(
                 f"{self._api_url}/api/v1/auth/validate",
-                headers=self._headers(),
+                headers=self._headers(
+                    method="GET",
+                    pathname="/api/v1/auth/validate",
+                    body=b"",
+                ),
             )
             if response.status_code in (401, 403):
                 msg = "Invalid API key. Check your API key at dashboard.openbox.ai"
@@ -176,16 +212,22 @@ class GovernanceClient:
 
         if os.environ.get("OPENBOX_DEBUG") == "1":
             import json
+
             print(
                 f"[OpenBox Debug] governance request: {json.dumps(payload, indent=2, default=str)}"
             )
 
         try:
             client = self._get_client()
+            body = _json_body(payload)
             response = await client.post(
                 f"{self._api_url}/api/v1/governance/evaluate",
-                headers=self._headers(),
-                json=payload,
+                headers=self._headers(
+                    method="POST",
+                    pathname="/api/v1/governance/evaluate",
+                    body=body,
+                ),
+                content=body,
             )
 
             if not response.is_success:
@@ -226,6 +268,7 @@ class GovernanceClient:
 
         if os.environ.get("OPENBOX_DEBUG") == "1":
             import json
+
             print(
                 "[OpenBox Debug] sync governance request:"
                 f" {json.dumps(payload, indent=2, default=str)}"
@@ -233,10 +276,15 @@ class GovernanceClient:
 
         try:
             client = self._get_sync_client()
+            body = _json_body(payload)
             response = client.post(
                 f"{self._api_url}/api/v1/governance/evaluate",
-                headers=self._headers(),
-                json=payload,
+                headers=self._headers(
+                    method="POST",
+                    pathname="/api/v1/governance/evaluate",
+                    body=body,
+                ),
+                content=body,
             )
 
             if not response.is_success:
@@ -256,9 +304,7 @@ class GovernanceClient:
                 raise OpenBoxNetworkError(msg) from e
             return None
 
-    async def poll_approval(
-        self, params: ApprovalPollParams
-    ) -> ApprovalResponse | None:
+    async def poll_approval(self, params: ApprovalPollParams) -> ApprovalResponse | None:
         """Poll for HITL approval status.
 
         Returns `None` on network failure so the caller can retry.
@@ -268,14 +314,21 @@ class GovernanceClient:
         """
         try:
             client = self._get_client()
-            response = await client.post(
-                f"{self._api_url}/api/v1/governance/approval",
-                headers=self._headers(),
-                json={
+            body = _json_body(
+                {
                     "workflow_id": params.workflow_id,
                     "run_id": params.run_id,
                     "activity_id": params.activity_id,
-                },
+                }
+            )
+            response = await client.post(
+                f"{self._api_url}/api/v1/governance/approval",
+                headers=self._headers(
+                    method="POST",
+                    pathname="/api/v1/governance/approval",
+                    body=body,
+                ),
+                content=body,
             )
 
             if not response.is_success:
@@ -287,6 +340,7 @@ class GovernanceClient:
             # SDK-side expiration check
             if parsed.approval_expiration_time and not parsed.expired:
                 from datetime import datetime
+
                 expiry = datetime.fromisoformat(
                     parsed.approval_expiration_time.replace("Z", "+00:00")
                 )
@@ -298,9 +352,7 @@ class GovernanceClient:
         except Exception:
             return None
 
-    async def evaluate_raw(
-        self, payload: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    async def evaluate_raw(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         """Send a pre-built payload to the governance evaluate endpoint.
 
         Used by hook-level governance where the payload is fully assembled
@@ -311,16 +363,22 @@ class GovernanceClient:
         """
         if os.environ.get("OPENBOX_DEBUG") == "1":
             import json
+
             print(
                 f"[OpenBox Debug] span hook request: {json.dumps(payload, indent=2, default=str)}"
             )
 
         try:
             client = self._get_client()
+            body = _json_body(payload)
             response = await client.post(
                 f"{self._api_url}/api/v1/governance/evaluate",
-                headers=self._headers(),
-                json=payload,
+                headers=self._headers(
+                    method="POST",
+                    pathname="/api/v1/governance/evaluate",
+                    body=body,
+                ),
+                content=body,
             )
 
             if not response.is_success:
@@ -354,5 +412,15 @@ class GovernanceClient:
     # Private helpers
     # ─────────────────────────────────────────────────────────────
 
-    def _headers(self) -> dict[str, str]:
-        return self._cached_headers
+    def _headers(self, *, method: str, pathname: str, body: bytes | str | None) -> dict[str, str]:
+        return build_auth_headers(
+            self._api_key,
+            method=method,
+            pathname=pathname,
+            body=body,
+            agent_identity=self._agent_identity,
+        )
+
+
+def _json_body(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
