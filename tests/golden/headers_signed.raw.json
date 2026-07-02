@@ -23,12 +23,12 @@
     "content-length": "325",
     "content-type": "application/json",
     "host": "core.openbox.ai",
-    "user-agent": "OpenBox-LangGraph-SDK/0.2.0",
+    "user-agent": "OpenBox-LangGraph-SDK/0.3.0",
     "x-openbox-agent-did": "did:aip:550e8400-e29b-41d4-a716-446655440000",
-    "x-openbox-agent-nonce": "9c103754-6ddf-4ccc-8518-40d2982d1941",
-    "x-openbox-agent-signature": "roaYgbF3f+Gc5w3TDQq6Kp87Mu2SJtul+qajIFcTUiBHGzgb6shYlDTy1ujKs9XuW/RTNP3WuYkPofbo3S7ZDw==",
-    "x-openbox-agent-timestamp": "2026-07-02T10:08:15.349341Z",
-    "x-openbox-body-sha256": "cf5437e32d3713f9db43ba2426386c70c1170e7a81755173916edc05cbc3fbc3",
-    "x-openbox-sdk-version": "0.2.0"
+    "x-openbox-agent-nonce": "fd0cc6b1-9f31-4080-aad7-c47174e3348c",
+    "x-openbox-agent-signature": "FcBdIVdF3czZ8go8LkJ+cj7KffQPfliuARZwhUCijqPxFXnwXQ+U13V/V4MuPut6KVPXBHeHEWKAD038VCFFAA==",
+    "x-openbox-agent-timestamp": "2026-07-02T16:22:10.893402Z",
+    "x-openbox-body-sha256": "3e4e6e32e9cf07152d91933601c9d1ecffc1a4467bb17a51cb20a5088e24d6b9",
+    "x-openbox-sdk-version": "0.3.0"
   }
 }

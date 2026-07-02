@@ -34,7 +34,7 @@ from openbox_langgraph.types import (
 if TYPE_CHECKING:
     from openbox_core.gate import GovernanceGate
 
-_SDK_VERSION = "0.2.0"
+_SDK_VERSION = "0.3.0"
 
 
 def _network_fallback_result(on_api_error: str, msg: str) -> GovernanceVerdictResponse | None:
