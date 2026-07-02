@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from openbox_core.contracts.results import ApprovalResult, EvaluationResult
 
 # ═══════════════════════════════════════════════════════════════════
 # Verdict
@@ -354,6 +357,13 @@ class GovernanceVerdictResponse:
     alignment_score: float | None = None
     behavioral_violations: list[str] | None = None
     constraints: list[Any] | None = None
+    # base-SDK fields (openbox_core.contracts.results.EvaluationResult parity).
+    # fallback_used marks a client-synthesized ALLOW produced on a NETWORK
+    # failure under fail_open — never set by a real Core response body — so
+    # callers can distinguish "Core said allow" from "Core was unreachable".
+    fallback_used: bool = False
+    diagnostics: list[Any] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
 
     @property
     def action(self) -> str:
@@ -405,6 +415,53 @@ class GovernanceVerdictResponse:
             constraints=data.get("constraints"),
         )
 
+    @classmethod
+    def from_result(cls, result: EvaluationResult) -> GovernanceVerdictResponse:
+        """Translate a base-SDK `EvaluationResult` into this SDK's response shape.
+
+        Field-for-field mapping — the base and LangGraph `Verdict` enums carry
+        identical string values but are distinct classes, so the verdict is
+        re-parsed through `Verdict.from_string` rather than compared/cast
+        directly. `guardrails`/`guardrails_result` on the base result are the
+        same object (see `EvaluationResult` docstring); either accessor works,
+        `guardrails` is used here since it is the primary field.
+        """
+        guardrails_result: GuardrailsResult | None = None
+        if gr := result.guardrails:
+            guardrails_result = GuardrailsResult(
+                input_type=gr.input_type or "activity_input",  # type: ignore[arg-type]
+                redacted_input=gr.redacted_input,
+                validation_passed=gr.validation_passed,
+                reasons=[
+                    GuardrailsReason(
+                        type=r.get("type", ""),
+                        field=r.get("field", ""),
+                        reason=r.get("reason", ""),
+                    )
+                    for r in gr.reasons
+                ],
+                raw_logs=gr.raw_logs,
+            )
+
+        return cls(
+            verdict=Verdict.from_string(result.verdict.value),
+            reason=result.reason,
+            policy_id=result.policy_id,
+            risk_score=result.risk_score,
+            metadata=result.metadata,
+            governance_event_id=result.governance_event_id,
+            guardrails_result=guardrails_result,
+            approval_id=result.approval_id,
+            approval_expiration_time=result.approval_expiration_time,
+            trust_tier=result.trust_tier,
+            alignment_score=result.alignment_score,
+            behavioral_violations=result.behavioral_violations,
+            constraints=result.constraints,
+            fallback_used=result.fallback_used,
+            diagnostics=list(result.diagnostics),
+            raw=dict(result.raw),
+        )
+
 
 def parse_governance_response(data: dict[str, Any]) -> GovernanceVerdictResponse:
     """Parse a raw dict from OpenBox Core into a `GovernanceVerdictResponse`."""
@@ -417,22 +474,72 @@ def parse_governance_response(data: dict[str, Any]) -> GovernanceVerdictResponse
 
 @dataclass
 class ApprovalResponse:
-    """HITL approval poll response from `/api/v1/governance/approval`."""
+    """HITL approval poll response from `/api/v1/governance/approval`.
+
+    `verdict` stays a concrete (non-Optional) `Verdict` — never `None` — so
+    every existing caller (`poll_until_decision`, `GovernanceBlockedError`,
+    demo/test call sites) keeps its exact type contract. A pending-unknown
+    decision (no `action`/`verdict` field, or an unrecognized value) maps to
+    `Verdict.REQUIRE_APPROVAL`, which `poll_until_decision` already treats as
+    "keep polling" — the same fallback behavior this SDK has always had for
+    anything that isn't a terminal ALLOW/BLOCK/HALT.
+    """
 
     verdict: Verdict
     reason: str | None = None
     approval_expiration_time: str | None = None
     expired: bool = False
 
+    @classmethod
+    def from_result(cls, result: ApprovalResult) -> ApprovalResponse:
+        """Translate a base-SDK `ApprovalResult` into this SDK's response shape.
+
+        `result.verdict` is already the base SDK's action-first, strict-
+        vocabulary decision (see `ApprovalResult.from_dict`) — `None` means
+        pending-unknown and is mapped to `Verdict.REQUIRE_APPROVAL` so
+        `poll_until_decision` keeps polling instead of raising or (worse)
+        treating it as approved. A non-`None` verdict is re-parsed through
+        this module's own `Verdict.from_string` because the base and
+        LangGraph `Verdict` enums are distinct classes with identical string
+        values, not interchangeable by identity/equality across modules.
+        """
+        verdict = (
+            Verdict.from_string(result.verdict.value)
+            if result.verdict is not None
+            else Verdict.REQUIRE_APPROVAL
+        )
+        return cls(
+            verdict=verdict,
+            reason=result.reason,
+            approval_expiration_time=result.approval_expiration_time,
+            expired=result.expired,
+        )
+
 
 def parse_approval_response(data: dict[str, Any]) -> ApprovalResponse:
-    """Parse a raw dict from the approval endpoint into an `ApprovalResponse`."""
-    return ApprovalResponse(
-        verdict=Verdict.from_string(data.get("verdict") or data.get("action")),
-        reason=data.get("reason"),
-        approval_expiration_time=data.get("approval_expiration_time"),
-        expired=bool(data.get("expired", False)),
-    )
+    """Parse a raw dict from the approval endpoint into an `ApprovalResponse`.
+
+    Delegates to the base SDK's `ApprovalResult.from_dict` for the
+    decision-source precedence and parsing strictness, both DELIBERATE
+    behavior changes from this module's own prior inline parsing:
+
+    - **Action wins over verdict** when both fields are present (the base
+      SDK's ``ApprovalResult`` decision-source precedence).
+    - **Strict decision vocabulary**: an unrecognized or empty
+      action/verdict string parses to "pending" (mapped to
+      `Verdict.REQUIRE_APPROVAL` below), never an auto-ALLOW. The lenient
+      `Verdict.from_string(None) -> ALLOW` fallback that this module used
+      before is HAZARDOUS at the human-approval trust boundary — a
+      malformed or truncated response body must never resolve to "approved".
+    """
+    return ApprovalResponse.from_result(_base_approval_result(data))
+
+
+def _base_approval_result(data: dict[str, Any]) -> ApprovalResult:
+    """Lazy import of the base-SDK parser — keeps this module import-light."""
+    from openbox_core.contracts.results import ApprovalResult as _CoreApprovalResult
+
+    return _CoreApprovalResult.from_dict(data)
 
 
 # ═══════════════════════════════════════════════════════════════════
