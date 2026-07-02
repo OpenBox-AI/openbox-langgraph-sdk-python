@@ -9,14 +9,15 @@ For framework-specific integrations (e.g. DeepAgents) use the dedicated
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from langchain_core.callbacks import AsyncCallbackHandler
@@ -24,9 +25,15 @@ from langchain_core.messages import BaseMessage
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 
+from openbox_langgraph.activity_context_binding import (
+    build_activity_context,
+    register_activity,
+    should_dual_write,
+    unregister_activity,
+)
 from openbox_langgraph.client import GovernanceClient
 from openbox_langgraph.config import GovernanceConfig, get_global_config, merge_config
-from openbox_langgraph.core_runtime import create_core_runtime
+from openbox_langgraph.core_runtime import create_core_runtime, get_trace_registry
 from openbox_langgraph.errors import (
     ApprovalExpiredError,
     ApprovalRejectedError,
@@ -327,6 +334,12 @@ class OpenBoxLangGraphHandlerOptions:
     skip_tool_types: set[str] = field(default_factory=set)
     hitl: Any = None  # HITLConfig | dict | None
     session_id: str | None = None
+    multi_agent_session_id: str | None = None
+    """Optional multi-agent session correlation id, kept separate from `session_id`.
+
+    Threaded onto the base SDK's `ActivityContext.multi_agent_session_id` when
+    `use_core_instrumentation`-style dual-write context binding is active;
+    unused on the legacy-only path (no wire field carries it today)."""
     agent_name: str | None = None
     task_queue: str = "langgraph"
     use_native_interrupt: bool = False
@@ -398,6 +411,7 @@ class OpenBoxLangGraphHandler:
             "skip_tool_types": opts.skip_tool_types,
             "hitl": opts.hitl,
             "session_id": opts.session_id,
+            "multi_agent_session_id": opts.multi_agent_session_id,
             "agent_name": opts.agent_name,
             "task_queue": opts.task_queue,
             "use_native_interrupt": opts.use_native_interrupt,
@@ -630,6 +644,27 @@ class OpenBoxLangGraphHandler:
 
         return workflow_started_sent, response
 
+    def _cleanup_turn(self, workflow_id: str) -> None:
+        """Drop this turn's core-runtime dual-write bindings + abort marks.
+
+        No-op when the handler has no core runtime (`_core_runtime is None` —
+        injected-client handlers, legacy-only). Every public entry point calls
+        this from the OUTERMOST `finally` of its stream loop so it runs
+        exactly once per turn regardless of success, mid-stream exception, or
+        (for `ainvoke`) an approved hook-approval retry — see the `finally`
+        placement in each entry point for why ordering after the retry matters.
+
+        Only sweeps THIS turn's `workflow_id` — never
+        `self._core_runtime.context_store.clear()`, which would also drop
+        another concurrent turn's bindings on the same handler (multiple
+        `ainvoke`/`astream*` calls can be in flight together) and the
+        runtime's `halt_requested` flag, neither of which is this turn's to
+        clear.
+        """
+        if self._core_runtime is None:
+            return
+        get_trace_registry(self._core_runtime).sweep(workflow_id)
+
     # ─────────────────────────────────────────────────────────────
     # Public invoke / ainvoke
     # ─────────────────────────────────────────────────────────────
@@ -733,6 +768,13 @@ class OpenBoxLangGraphHandler:
             )
             _logger.info("[OpenBox] Approval granted, retrying ainvoke")
             final_output = await self._graph.ainvoke(input, config=cfg, **kwargs)
+        finally:
+            # Outermost `finally` on purpose: an approval retry re-runs the
+            # graph INSIDE the `except` blocks above, so this only fires once
+            # the (possibly retried) turn is fully done — the retry keeps its
+            # dual-write context intact instead of racing a cleanup that
+            # unregisters it mid-retry. See `_cleanup_turn`.
+            self._cleanup_turn(workflow_id)
 
         return final_output
 
@@ -778,20 +820,28 @@ class OpenBoxLangGraphHandler:
         cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
 
         _debug = os.environ.get("OPENBOX_DEBUG") == "1"
-        async for event in self._graph.astream_events(
-            input, config=cfg, version="v2", **kwargs
-        ):
-            stream_event = LangGraphStreamEvent.from_dict(event)
-            if _debug and "_stream" not in stream_event.event:
-                sys.stderr.write(
-                    f"[OBX_EVENT] {stream_event.event:<25} name={stream_event.name!r:<35} "
-                    f"node={stream_event.metadata.get('langgraph_node')!r}\n"
+        try:
+            async for event in self._graph.astream_events(
+                input, config=cfg, version="v2", **kwargs
+            ):
+                stream_event = LangGraphStreamEvent.from_dict(event)
+                if _debug and "_stream" not in stream_event.event:
+                    sys.stderr.write(
+                        f"[OBX_EVENT] {stream_event.event:<25} name={stream_event.name!r:<35} "
+                        f"node={stream_event.metadata.get('langgraph_node')!r}\n"
+                    )
+                await self._process_event(
+                    stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
+                    workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
                 )
-            await self._process_event(
-                stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
-                workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
-            )
-            yield event
+                yield event
+        finally:
+            # Outermost `finally` on an async generator fires on normal
+            # exhaustion, an exception raised through the loop, OR the
+            # caller closing/abandoning this generator (`aclose()` / GC) —
+            # covering the mid-stream-raise and early-break cases the plain
+            # `try/except` in `ainvoke` doesn't need to (it has no yield).
+            self._cleanup_turn(workflow_id)
 
     async def astream(
         self,
@@ -805,8 +855,27 @@ class OpenBoxLangGraphHandler:
         ``graph.astream(...)`` can use this handler as a drop-in replacement
         for a ``CompiledStateGraph``.
         """
-        async for chunk in self.astream_governed(input, config=config, **kwargs):
-            yield chunk
+        # This method mints no turn of its own (astream_governed does) — the
+        # `contextlib.aclosing` here exists ONLY so an abandoned/early-broken
+        # `astream` generator still closes the inner `astream_governed`
+        # generator it delegates to. Without it, `GeneratorExit` thrown into
+        # THIS generator's suspended `yield chunk` below never reaches the
+        # `async for` over `inner`, so `astream_governed`'s own turn cleanup
+        # would never run — verified empirically: `GeneratorExit` on an outer
+        # generator's `aclose()` does NOT propagate into an inner generator
+        # merely being iterated via `async for`, only into an explicit
+        # `aclose()` call on that inner generator from a `finally` here.
+        # `cast` is safe: `astream_governed` has a `yield` in its body, so its
+        # runtime type is always an async generator — `AsyncIterator` is only
+        # its PUBLIC return annotation (matching `astream`'s own, for a
+        # drop-in `CompiledStateGraph` surface), not what `aclosing` needs.
+        governed = cast(
+            "AsyncGenerator[dict[str, Any], None]",
+            self.astream_governed(input, config=config, **kwargs),
+        )
+        async with contextlib.aclosing(governed) as inner:
+            async for chunk in inner:
+                yield chunk
 
     async def astream_events(
         self,
@@ -846,15 +915,21 @@ class OpenBoxLangGraphHandler:
         cfg = dict(config or {})
         cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
 
-        async for event in self._graph.astream_events(
-            input, config=cfg, version=version, **kwargs
-        ):
-            stream_event = LangGraphStreamEvent.from_dict(event)
-            await self._process_event(
-                stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
-                workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
-            )
-            yield event
+        try:
+            async for event in self._graph.astream_events(
+                input, config=cfg, version=version, **kwargs
+            ):
+                stream_event = LangGraphStreamEvent.from_dict(event)
+                await self._process_event(
+                    stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
+                    workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
+                )
+                yield event
+        finally:
+            # See astream_governed's identical finally for why this covers
+            # normal exhaustion, mid-stream exceptions, AND an abandoned
+            # generator (aclose()/GC) alike.
+            self._cleanup_turn(workflow_id)
 
     # ─────────────────────────────────────────────────────────────
     # Event processing
@@ -1248,6 +1323,8 @@ class OpenBoxLangGraphHandler:
             if buf is not None:
                 buf.subagent_name = subagent_name
 
+            tool_type = self._resolve_tool_type(name, subagent_name)
+
             # Create OTel span to propagate trace context across asyncio.Task boundaries.
             # Tool execution happens in a spawned Task with a new OTel context — this span
             # bridges the gap so httpx child spans inherit the correct trace_id.
@@ -1260,11 +1337,34 @@ class OpenBoxLangGraphHandler:
                 trace_id = tool_span.get_span_context().trace_id
                 if trace_id:
                     self._span_processor.register_trace(trace_id, workflow_id, event_run_id)
+                    # Dual-write (ADDITIVE, opt-in): mirror the SAME trace-id
+                    # registration into the base runtime's private trace
+                    # registry — trace-only, never a ContextVar bind (see
+                    # module docstring). No-op when this handler has no core
+                    # runtime (injected-client handlers, `_core_runtime is None`).
+                    if should_dual_write(self._core_runtime):
+                        register_activity(
+                            self._core_runtime,
+                            trace_id,
+                            build_activity_context(
+                                config=self._config,
+                                workflow_id=workflow_id,
+                                run_id=run_id,
+                                activity_id=event_run_id,
+                                activity_type=name,
+                                activity_input=safe_serialize(data.get("input")),
+                                langgraph_node=langgraph_node,
+                                langgraph_step=langgraph_step,
+                                tool_type=tool_type,
+                                tool_name=name,
+                                subagent_name=subagent_name,
+                                parent_ids=event.parent_ids,
+                            ),
+                        )
                 if buf is not None:
                     buf.otel_span = tool_span
                     buf.otel_token = token
             tool_input = _unwrap_tool_input(data.get("input"))
-            tool_type = self._resolve_tool_type(name, subagent_name)
             # NOTE: No internal span here. In the Temporal SDK, @traced spans
             # fire DURING activity execution — after ActivityStarted is stored
             # in Core.  Firing here would race with the ToolStarted event below
@@ -1298,26 +1398,53 @@ class OpenBoxLangGraphHandler:
                 return None, False, False, "ToolCompleted"
             dur = buffer.duration_ms(event_run_id)
             buf = buffer.get(event_run_id)
+            tool_type = self._resolve_tool_type(name, subagent_name)
+            completed_activity_id = f"{event_run_id}-c"
 
             # End OTel span created in on_tool_start and detach context
             if buf is not None and buf.otel_span is not None:
+                trace_id = buf.otel_span.get_span_context().trace_id
                 if buf.otel_token is not None:
                     otel_context.detach(buf.otel_token)
                 buf.otel_span.end()
+                # Dual-write (ADDITIVE, opt-in): update the same trace-id
+                # binding to the COMPLETED activity identity for the brief
+                # window a completion hook could still resolve it (mirrors the
+                # legacy clear_activity_context timing), then unregister —
+                # the trace's underlying OTel span is now ended, so nothing
+                # else will ever look it up again.
+                if trace_id and should_dual_write(self._core_runtime):
+                    register_activity(
+                        self._core_runtime,
+                        trace_id,
+                        build_activity_context(
+                            config=self._config,
+                            workflow_id=workflow_id,
+                            run_id=run_id,
+                            activity_id=completed_activity_id,
+                            activity_type=name,
+                            activity_input=data.get("output"),
+                            langgraph_node=langgraph_node,
+                            langgraph_step=langgraph_step,
+                            tool_type=tool_type,
+                            tool_name=name,
+                            subagent_name=subagent_name,
+                            parent_ids=event.parent_ids,
+                        ),
+                    )
+                    unregister_activity(self._core_runtime, trace_id)
 
             # Clear SpanProcessor activity context for all tools
             if getattr(self, '_span_processor', None) is not None:
                 self._span_processor.clear_activity_context(workflow_id, event_run_id)
 
             buffer.remove(event_run_id)
-            completed_activity_id = f"{event_run_id}-c"
             tool_output = data.get("output")
             serialized_output = (
                 safe_serialize({"result": tool_output})
                 if isinstance(tool_output, str)
                 else safe_serialize(tool_output)
             )
-            tool_type = self._resolve_tool_type(name, subagent_name)
             gov = LangChainGovernanceEvent(
                 source="workflow-telemetry",
                 event_type="ToolCompleted",
@@ -1367,6 +1494,26 @@ class OpenBoxLangGraphHandler:
                 trace_id = llm_span.get_span_context().trace_id
                 if trace_id:
                     self._span_processor.register_trace(trace_id, workflow_id, event_run_id)
+                    # Dual-write (ADDITIVE, opt-in) — registered regardless of
+                    # whether LLMStarted ends up sent below (empty-prompt
+                    # subagent-internal LLM calls still get span-hook
+                    # governance during the call, mirroring the legacy path).
+                    if should_dual_write(self._core_runtime):
+                        register_activity(
+                            self._core_runtime,
+                            trace_id,
+                            build_activity_context(
+                                config=self._config,
+                                workflow_id=workflow_id,
+                                run_id=run_id,
+                                activity_id=event_run_id,
+                                activity_type="llm_call",
+                                langgraph_node=langgraph_node,
+                                langgraph_step=langgraph_step,
+                                subagent_name=subagent_name,
+                                parent_ids=event.parent_ids,
+                            ),
+                        )
                 buf = buffer.get(event_run_id)
                 if buf is not None:
                     buf.otel_span = llm_span
@@ -1412,9 +1559,19 @@ class OpenBoxLangGraphHandler:
 
             # End OTel span created in on_chat_model_start and detach context
             if buf is not None and buf.otel_span is not None:
+                llm_trace_id = buf.otel_span.get_span_context().trace_id
                 if buf.otel_token is not None:
                     otel_context.detach(buf.otel_token)
                 buf.otel_span.end()
+                # Dual-write (ADDITIVE, opt-in) cleanup: the LLM's OWN OTel
+                # span/trace_id (distinct from the parent tool's, if any) is
+                # ending now — unregister it from the base registry so it
+                # never resolves after this point. This is UNRELATED to the
+                # legacy `_activity_context` dict note below, which is keyed
+                # by workflow_id:activity_id (shared with the parent tool),
+                # not by this trace_id.
+                if llm_trace_id and should_dual_write(self._core_runtime):
+                    unregister_activity(self._core_runtime, llm_trace_id)
 
             buffer.remove(event_run_id)
             # Don't clear SpanProcessor activity context here — the tool (parent)
