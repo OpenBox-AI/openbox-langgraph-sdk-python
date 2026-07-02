@@ -141,4 +141,15 @@ def create_core_runtime(
     # which uses whichever manager is attached here.
     runtime._instrumentation_manager = manager
     manager.install()
+    # manager.install() published a base HookRuntime to the shared
+    # instrumentation state; swap in the LangGraph-owned one that pins a source
+    # span's ActivityContext at STARTED and reuses it at COMPLETED, so a hook
+    # span can't be split across two activities when the trace-lookup fallback
+    # drifts to a later activity. manager.uninstall() (via runtime.close/aclose)
+    # resets the shared runtime to None, so no teardown change is needed here.
+    from openbox_core.instrumentation.shared import set_hook_runtime
+
+    from openbox_langgraph.langgraph_hook_runtime import LangGraphHookRuntime
+
+    set_hook_runtime(LangGraphHookRuntime(runtime))
     return runtime
