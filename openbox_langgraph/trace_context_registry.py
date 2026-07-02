@@ -149,6 +149,24 @@ class TraceContextRegistry:
         for wf_id, activity_id in activity_keys:
             self._store.clear_activity_aborted(wf_id, activity_id)
 
+    def clear_aborted_for_workflow(self, workflow_id: str | None) -> None:
+        """Clear the base ``ContextStore`` abort mark for every activity THIS
+        registry has ever tracked under ``workflow_id`` — WITHOUT touching
+        trace bindings or ``_activity_keys`` bookkeeping (unlike ``sweep``).
+
+        Used by the opt-in hook runtime's post-approval reset (an approved
+        REQUIRE_APPROVAL retry re-runs the SAME turn's ``workflow_id`` but
+        bypasses this SDK's own dual-write registration entirely — it calls
+        the underlying graph's ``ainvoke`` directly — so the retry's tool/LLM
+        calls can only resolve context via the FIRST pass's still-registered
+        trace bindings; dropping those here, as ``sweep`` would, leaves the
+        retry ungoverned instead of governed).
+        """
+        with self._lock:
+            keys = [k for k in self._activity_keys if k[0] == workflow_id]
+        for wf_id, activity_id in keys:
+            self._store.clear_activity_aborted(wf_id, activity_id)
+
     def resolve(self, trace_id: int | str) -> ActivityContext | None:
         """Exact-trace -> single-active -> last-registered, fail-loud on total miss.
 
@@ -216,10 +234,24 @@ def get_trace_registry(runtime: OpenBoxRuntime) -> TraceContextRegistry:
     -per-runtime isolation guarantee ``core_runtime.create_core_runtime``
     provides. Keyed on the runtime OBJECT itself (weakly) — see the
     `_registries` module comment for why an `id()`-keyed cache is unsafe here.
+
+    When ``runtime.context_store`` already owns a ``registry`` attribute that
+    IS a ``TraceContextRegistry`` (``fallback_context_store.FallbackContextStore``
+    — checked by duck type, not import, to avoid a circular import with that
+    module), THAT SAME instance is reused instead of creating a second,
+    independent one bound to the identical store: the store's own
+    ``context_for_trace`` override consults exactly that registry's fallback
+    ladder, so a caller-side dual-write (``register``/``unregister`` via this
+    function) MUST land on the one instance the store itself resolves
+    through, not a shadow copy that would always report a miss.
     """
     with _registries_lock:
         registry = _registries.get(runtime)
         if registry is None:
-            registry = TraceContextRegistry(runtime.context_store)
+            owned = getattr(runtime.context_store, "registry", None)
+            registry = (
+                owned if isinstance(owned, TraceContextRegistry)
+                else TraceContextRegistry(runtime.context_store)
+            )
             _registries[runtime] = registry
         return registry
