@@ -343,6 +343,13 @@ class OpenBoxLangGraphHandlerOptions:
     agent_name: str | None = None
     task_queue: str = "langgraph"
     use_native_interrupt: bool = False
+    use_core_instrumentation: bool = False
+    """Experimental, OPT-IN: route governance through the shared ``openbox_core``
+    hook runtime (``LangGraphFrameworkAdapter`` + base instrumentation) instead
+    of relying solely on the legacy in-repo OTel hooks. Default ``False`` keeps
+    the legacy-only path byte-for-byte unchanged. Has no effect when `client`
+    is injected — no core runtime is built in that case, so there is nothing
+    for base instrumentation to arm."""
     root_node_names: set[str] = field(default_factory=set)
     resolve_subagent_name: Callable[[LangGraphStreamEvent], str | None] | None = None
     """Optional hook for framework-specific subagent name detection.
@@ -415,9 +422,26 @@ class OpenBoxLangGraphHandler:
             "agent_name": opts.agent_name,
             "task_queue": opts.task_queue,
             "use_native_interrupt": opts.use_native_interrupt,
+            "use_core_instrumentation": opts.use_core_instrumentation,
             "root_node_names": opts.root_node_names,
             "tool_type_map": opts.tool_type_map or {},
         })
+
+        # Span processor built FIRST (before the core runtime) so its
+        # instance can be threaded into `create_core_runtime` below as
+        # `legacy_span_processor` — the opt-in adapter's post-approval reset
+        # needs it to clear the LEGACY abort mark too, not just the base
+        # ContextStore's. Built unconditionally whenever global config is
+        # populated, matching the pre-reorder behavior exactly: even an
+        # injected-client handler (`opts.client` truthy, `_core_runtime is
+        # None`) gets a real `_span_processor` here — this was already true
+        # before this reordering, only the WITHIN-`__init__` sequencing moved.
+        gc = get_global_config()
+        if gc and gc.api_url and gc.api_key:
+            from openbox_langgraph.span_processor import WorkflowSpanProcessor
+            self._span_processor = WorkflowSpanProcessor()
+        else:
+            self._span_processor = None
 
         if opts.client:
             # Injected client (e.g. a test double, or a subclass overriding
@@ -446,6 +470,8 @@ class OpenBoxLangGraphHandler:
                 governance_timeout=gc.governance_timeout,
                 agent_did=gc.agent_did,
                 agent_private_key=gc.agent_private_key,
+                legacy_span_processor=self._span_processor,
+                extra_ignored_urls={gc.api_url} if gc.api_url else None,
             )
             self._client = GovernanceClient(
                 api_url=gc.api_url,
@@ -460,9 +486,35 @@ class OpenBoxLangGraphHandler:
         # Setup OTel HTTP governance hooks (required)
         gc = get_global_config()
         if gc and gc.api_url and gc.api_key:
-            from openbox_langgraph.otel_setup import setup_opentelemetry_for_governance
-            from openbox_langgraph.span_processor import WorkflowSpanProcessor
-            self._span_processor = WorkflowSpanProcessor()
+            from openbox_langgraph.otel_setup import (
+                FAMILY_ASYNCPG,
+                FAMILY_DBAPI,
+                FAMILY_FILE,
+                FAMILY_HTTP,
+                FAMILY_SQLALCHEMY,
+                setup_opentelemetry_for_governance,
+            )
+            # Hybrid exclusivity: when the opt-in core runtime is
+            # armed, base already installed its OWN wrappers for every family
+            # it covers (http, dbapi, asyncpg, sqlalchemy, file) via
+            # `create_core_runtime` above — this call must skip those SAME
+            # families so neither a silent double-evaluation nor a
+            # last-writer-wins governance gap occurs (see otel_setup.py's
+            # module docstring for the exact collision per family). Families
+            # base has no coverage for (urllib3, urllib, pymongo, redis) are
+            # never skipped — legacy remains their only governance.
+            #
+            # Gated on `self._core_runtime is not None`, NOT merely the flag:
+            # an injected `opts.client` makes `_core_runtime` unconditionally
+            # `None` regardless of `use_core_instrumentation` — no base
+            # instrumentation was ever installed to replace legacy's in that
+            # case, so skipping legacy here would be a pure GAP with nothing
+            # to fill it.
+            skip_families = (
+                {FAMILY_HTTP, FAMILY_DBAPI, FAMILY_ASYNCPG, FAMILY_SQLALCHEMY, FAMILY_FILE}
+                if self._config.use_core_instrumentation and self._core_runtime is not None
+                else None
+            )
             setup_opentelemetry_for_governance(
                 span_processor=self._span_processor,
                 api_url=gc.api_url,
@@ -473,10 +525,9 @@ class OpenBoxLangGraphHandler:
                 sqlalchemy_engine=opts.sqlalchemy_engine,
                 agent_did=gc.agent_did,
                 agent_private_key=gc.agent_private_key,
+                skip_families=skip_families,
             )
             _logger.debug("[OpenBox] OTel HTTP governance hooks enabled")
-        else:
-            self._span_processor = None
 
     # ─────────────────────────────────────────────────────────────
     # Pre-screen: enforce guardrails before stream starts
@@ -665,6 +716,27 @@ class OpenBoxLangGraphHandler:
             return
         get_trace_registry(self._core_runtime).sweep(workflow_id)
 
+    def _reset_after_approval(self, workflow_id: str) -> None:
+        """Clear the abort mark(s) a hook set for this turn BEFORE an approved
+        REQUIRE_APPROVAL retry re-invokes the graph, so the retry runs
+        GOVERNED instead of short-circuiting on the stale abort flag the
+        blocked first pass left behind.
+
+        No-op when the handler has no core runtime (`_core_runtime is None`)
+        OR the runtime's adapter is the base default `CoreAdapter` (only
+        reachable when `use_core_instrumentation=False` — that adapter has no
+        `reset_after_approval`, matching this turn never having armed base
+        instrumentation in the first place, so there is nothing to reset).
+        Call BEFORE re-invoking the graph, AFTER `poll_until_decision`
+        resolves — matches `LangGraphFrameworkAdapter.reset_after_approval`'s
+        own ordering contract.
+        """
+        if self._core_runtime is None:
+            return
+        reset = getattr(self._core_runtime.adapter, "reset_after_approval", None)
+        if reset is not None:
+            reset(workflow_id)
+
     # ─────────────────────────────────────────────────────────────
     # Public invoke / ainvoke
     # ─────────────────────────────────────────────────────────────
@@ -754,6 +826,7 @@ class OpenBoxLangGraphHandler:
                 self._config.hitl,
             )
             _logger.info("[OpenBox] Approval granted, retrying ainvoke")
+            self._reset_after_approval(workflow_id)
             final_output = await self._graph.ainvoke(input, config=cfg, **kwargs)
         except Exception as exc:
             hook_err = _extract_governance_blocked(exc)
@@ -767,6 +840,7 @@ class OpenBoxLangGraphHandler:
                 self._config.hitl,
             )
             _logger.info("[OpenBox] Approval granted, retrying ainvoke")
+            self._reset_after_approval(workflow_id)
             final_output = await self._graph.ainvoke(input, config=cfg, **kwargs)
         finally:
             # Outermost `finally` on purpose: an approval retry re-runs the

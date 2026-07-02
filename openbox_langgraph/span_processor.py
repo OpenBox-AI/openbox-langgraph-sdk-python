@@ -202,6 +202,21 @@ class WorkflowSpanProcessor:
         with self._lock:
             self._aborted_activities.pop(f"{workflow_id}:{activity_id}", None)
 
+    def clear_workflow_abort(self, workflow_id: str) -> None:
+        """Clear EVERY abort flag registered under ``workflow_id`` — narrower
+        than ``unregister_workflow`` (which also drops buffers/verdicts/trace
+        maps this needs to survive): a REQUIRE_APPROVAL retry re-runs the same
+        turn's ``workflow_id`` directly against the underlying graph, bypassing
+        this SDK's own per-activity registration, so the exact ``activity_id``
+        an approved retry's operations will use is unknown up front — only the
+        turn's ``workflow_id`` is. Only the abort-flag map is touched.
+        """
+        with self._lock:
+            prefix = f"{workflow_id}:"
+            stale = [k for k in self._aborted_activities if k.startswith(prefix)]
+            for k in stale:
+                del self._aborted_activities[k]
+
     # ═══════════════════════════════════════════════════════════════════════════
     # Halt Request (hook → activity interceptor for HALT verdict)
     # ═══════════════════════════════════════════════════════════════════════════

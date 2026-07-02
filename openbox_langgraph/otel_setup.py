@@ -21,6 +21,20 @@ Supported database libraries:
 - pymongo (MongoDB)
 - redis
 - sqlalchemy (ORM)
+
+``skip_families`` (opt-in hook runtime hybrid exclusivity): when
+``use_core_instrumentation=True``, the base ``openbox_core`` runtime installs
+its OWN wrappers for the families it covers (http, dbapi, asyncpg,
+sqlalchemy, file). Every one of those collides with this module's patches at
+the SAME attribute — ``CursorTracer.traced_execution``/``asyncpg.Connection.
+execute``/``builtins.open`` are last-writer-wins overwrites (the loser's
+governance silently disappears), the OTel HTTP instrumentors are
+per-class singletons (a second ``.instrument()`` call is a silent no-op), and
+``sqlalchemy.event.listen`` fires EVERY registered listener (both would
+evaluate the SAME query twice). ``skip_families`` lets the caller name which
+of THIS module's family blocks to skip so the base wrapper is the only one
+active for that family — legacy keeps the families base has no coverage for
+(urllib3, urllib, pymongo, redis) unconditionally.
 """
 
 import logging
@@ -50,6 +64,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Family names ``skip_families`` recognizes — matches the base SDK's own
+# ``InstrumentationConfig`` family boundaries exactly (http covers both
+# requests+httpx; dbapi covers psycopg2/mysql/pymysql/sqlite3, all funneled
+# through the SAME ``CursorTracer.traced_execution`` patch point).
+FAMILY_HTTP = "http"
+FAMILY_DBAPI = "dbapi"
+FAMILY_ASYNCPG = "asyncpg"
+FAMILY_SQLALCHEMY = "sqlalchemy"
+FAMILY_FILE = "file"
+
 # Global state — hooks in sub-modules reference these via late import of this module
 _span_processor: Optional["WorkflowSpanProcessor"] = None
 _ignored_url_prefixes: set[str] = set()
@@ -69,6 +93,7 @@ def setup_opentelemetry_for_governance(
     on_api_error: str = "fail_open",
     agent_did: str | None = None,
     agent_private_key: str | None = None,
+    skip_families: set[str] | None = None,
 ) -> None:
     """
     Setup OpenTelemetry instrumentors with body capture hooks.
@@ -92,9 +117,17 @@ def setup_opentelemetry_for_governance(
                           created via create_engine() will be instrumented.
         agent_did: Optional OpenBox agent DID for AIP request signing.
         agent_private_key: Optional OpenBox agent private key for AIP request signing.
+        skip_families: Family names (``FAMILY_HTTP``/``FAMILY_DBAPI``/
+                          ``FAMILY_ASYNCPG``/``FAMILY_SQLALCHEMY``/``FAMILY_FILE``)
+                          this module must NOT install its own patches for — the
+                          base ``openbox_core`` runtime installs those instead
+                          (see the module docstring for exactly why running
+                          both collides). Default ``None`` skips nothing —
+                          identical to every caller that predates this parameter.
     """
     global _span_processor, _ignored_url_prefixes
     _span_processor = span_processor
+    families_to_skip = skip_families or set()
 
     # Set ignored URL prefixes (always include api_url to prevent recursion)
     _ignored_url_prefixes = set(ignored_urls) if ignored_urls else set()
@@ -129,34 +162,41 @@ def setup_opentelemetry_for_governance(
 
     # Track what was instrumented
     instrumented = []
+    skip_http = FAMILY_HTTP in families_to_skip
 
     # 1. requests library
-    try:
-        from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    if skip_http:
+        logger.info("requests instrumentation skipped — base runtime covers this family")
+    else:
+        try:
+            from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
-        RequestsInstrumentor().instrument(
-            request_hook=_requests_request_hook,
-            response_hook=_requests_response_hook,
-        )
-        instrumented.append("requests")
-        logger.info("Instrumented: requests")
-    except ImportError:
-        logger.debug("requests instrumentation not available")
+            RequestsInstrumentor().instrument(
+                request_hook=_requests_request_hook,
+                response_hook=_requests_response_hook,
+            )
+            instrumented.append("requests")
+            logger.info("Instrumented: requests")
+        except ImportError:
+            logger.debug("requests instrumentation not available")
 
     # 2. httpx library (sync + async) - hooks for metadata only
-    try:
-        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    if skip_http:
+        logger.info("httpx instrumentation skipped — base runtime covers this family")
+    else:
+        try:
+            from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
-        HTTPXClientInstrumentor().instrument(
-            request_hook=_httpx_request_hook,
-            response_hook=_httpx_response_hook,
-            async_request_hook=_httpx_async_request_hook,
-            async_response_hook=_httpx_async_response_hook,
-        )
-        instrumented.append("httpx")
-        logger.info("Instrumented: httpx")
-    except ImportError:
-        logger.debug("httpx instrumentation not available")
+            HTTPXClientInstrumentor().instrument(
+                request_hook=_httpx_request_hook,
+                response_hook=_httpx_response_hook,
+                async_request_hook=_httpx_async_request_hook,
+                async_response_hook=_httpx_async_response_hook,
+            )
+            instrumented.append("httpx")
+            logger.info("Instrumented: httpx")
+        except ImportError:
+            logger.debug("httpx instrumentation not available")
 
     # 3. urllib3 library
     try:
@@ -183,8 +223,15 @@ def setup_opentelemetry_for_governance(
     except ImportError:
         logger.debug("urllib instrumentation not available")
 
-    # 5. httpx body capture (separate from OTel - patches Client.send)
-    setup_httpx_body_capture(span_processor)
+    # 5. httpx body capture (separate from OTel - patches Client.send). This
+    # ALSO calls `_hook_gov.evaluate_sync`/`evaluate_async` directly — an
+    # independent completed-stage evaluation, not merely OTel span metadata —
+    # so it must skip alongside the OTel httpx instrumentor above, not just
+    # when that block itself fails to import.
+    if skip_http:
+        logger.info("httpx body capture skipped — base runtime covers this family")
+    else:
+        setup_httpx_body_capture(span_processor)
 
     logger.info(f"OpenTelemetry HTTP instrumentation complete. Instrumented: {instrumented}")
 
@@ -195,14 +242,21 @@ def setup_opentelemetry_for_governance(
             "engine will not be instrumented"
         )
     if instrument_databases:
-        db_instrumented = setup_database_instrumentation(db_libraries, sqlalchemy_engine)
+        db_instrumented = setup_database_instrumentation(
+            db_libraries, sqlalchemy_engine, families_to_skip
+        )
         if db_instrumented:
             instrumented.extend(db_instrumented)
 
-    # 7. File I/O instrumentation (optional)
-    if instrument_file_io:
+    # 7. File I/O instrumentation (optional). Skipped under FAMILY_FILE: both
+    # this module and the base runtime patch `builtins.open` directly —
+    # last-writer-wins, so running both silently drops whichever installed
+    # first's governance for every file open in the process.
+    if instrument_file_io and FAMILY_FILE not in families_to_skip:
         if setup_file_io_instrumentation():
             instrumented.append("file_io")
+    elif instrument_file_io:
+        logger.info("file I/O instrumentation skipped — base runtime covers this family")
 
     logger.info(f"OpenTelemetry governance setup complete. Instrumented: {instrumented}")
 
@@ -210,6 +264,7 @@ def setup_opentelemetry_for_governance(
 def setup_database_instrumentation(
     db_libraries: set[str] | None = None,
     sqlalchemy_engine: Any | None = None,
+    skip_families: set[str] | None = None,
 ) -> list[str]:
     """
     Setup OpenTelemetry database instrumentors.
@@ -232,11 +287,19 @@ def setup_database_instrumentation(
                           provided, registers event listeners on this engine to capture
                           queries. Without this, only engines created after this call
                           (via patched create_engine) will be instrumented.
+        skip_families: See ``setup_opentelemetry_for_governance``'s docstring.
+                          Per-library OTel span-creation instrumentors (which
+                          base never touches) still install even when their
+                          family is skipped — only the GOVERNANCE-EVALUATING
+                          hook installer for that family is skipped, since
+                          that installer is what collides with base's own
+                          wrapper for the SAME attribute/event.
 
     Returns:
         List of successfully instrumented library names
     """
     instrumented = []
+    families_to_skip = skip_families or set()
 
     # ── pymongo CommandListener first (must register before MongoClient creation) ──
     if db_libraries is None or "pymongo" in db_libraries:
@@ -339,8 +402,13 @@ def setup_database_instrumentation(
                         f"sqlalchemy_engine must be a sqlalchemy.engine.Engine instance, "
                         f"got {type(sqlalchemy_engine).__name__}"
                     )
-                # Governance hooks on engine events
-                _db_gov.setup_sqlalchemy_hooks(sqlalchemy_engine)
+                # Governance hooks on engine events — skipped when the base
+                # runtime's OWN class-level `event.listen(Engine, ...)` covers
+                # this family (both would fire for this engine otherwise;
+                # `SQLAlchemyInstrumentor` below is pure OTel span metadata,
+                # never a governance-evaluate call, so it stays unconditional).
+                if FAMILY_SQLALCHEMY not in families_to_skip:
+                    _db_gov.setup_sqlalchemy_hooks(sqlalchemy_engine)
                 # Instrument the existing engine directly (registers event listeners)
                 SQLAlchemyInstrumentor().instrument(engine=sqlalchemy_engine)
                 logger.info("Instrumented: sqlalchemy (existing engine)")
@@ -356,14 +424,28 @@ def setup_database_instrumentation(
     # OTel dbapi instrumentors silently discard request_hook/response_hook kwargs.
     # Instead, we patch CursorTracer.traced_execution to inject governance hooks
     # around the query_method call (runs inside the OTel span context).
+    # Skipped under FAMILY_DBAPI: base patches the SAME
+    # `CursorTracer.traced_execution` attribute — whichever installs LAST would
+    # silently overwrite the other's governance for psycopg2/mysql/pymysql/sqlite3.
     dbapi_libs = {"psycopg2", "mysql", "pymysql", "sqlite3"}
-    if any(lib in instrumented for lib in dbapi_libs):
+    if FAMILY_DBAPI in families_to_skip:
+        logger.info(
+            "CursorTracer governance hooks skipped — base runtime covers dbapi libs"
+        )
+    elif any(lib in instrumented for lib in dbapi_libs):
         if _db_gov.install_cursor_tracer_hooks():
             logger.info("CursorTracer governance hooks installed for dbapi libs")
 
-    # asyncpg uses its own _do_execute (not CursorTracer) — needs separate wrapt hooks
+    # asyncpg uses its own _do_execute (not CursorTracer) — needs separate wrapt
+    # hooks. Skipped under FAMILY_ASYNCPG: base wraps `Connection._execute`
+    # directly, and legacy's wrapt wrapper sits on the PUBLIC `Connection.execute`
+    # (which calls `_execute` internally) — both active means every asyncpg
+    # query is evaluated TWICE, once per wrapper layer.
     if "asyncpg" in instrumented:
-        _db_gov.install_asyncpg_hooks()
+        if FAMILY_ASYNCPG in families_to_skip:
+            logger.info("asyncpg governance hooks skipped — base runtime covers this family")
+        else:
+            _db_gov.install_asyncpg_hooks()
 
     if instrumented:
         logger.info(f"Database instrumentation complete. Instrumented: {instrumented}")
