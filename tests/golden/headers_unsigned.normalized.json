@@ -18,7 +18,7 @@
     "content-length": "325",
     "content-type": "application/json",
     "host": "core.openbox.ai",
-    "user-agent": "OpenBox-LangGraph-SDK/0.2.0",
-    "x-openbox-sdk-version": "0.2.0"
+    "user-agent": "OpenBox-LangGraph-SDK/0.3.0",
+    "x-openbox-sdk-version": "0.3.0"
   }
 }
