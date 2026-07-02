@@ -17,6 +17,8 @@ Example:
     ... )
 """
 
+__version__ = "0.2.0"
+
 from openbox_langgraph.client import GovernanceClient, build_auth_headers
 from openbox_langgraph.config import (
     GovernanceConfig,
@@ -115,6 +117,7 @@ __all__ = [
     "WorkflowEventType",
     "WorkflowSpanBuffer",
     "WorkflowSpanProcessor",
+    "__version__",
     "build_agent_identity_canonical_request",
     "build_auth_headers",
     "create_agent_identity_headers",
