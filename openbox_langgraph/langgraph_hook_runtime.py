@@ -15,31 +15,31 @@ was active can COMPLETE after the run has moved on to ``llm_call``, and the
 completed stage is mis-attributed to ``llm_call``. Core then sees one source
 span split across two ``activity_id``s.
 
-Fix: pin the context resolved at STARTED, keyed by the SOURCE span's identity,
-and reuse that exact context at COMPLETED. The key is
-``(trace_id, span_id, hook_type)`` — NOT ``trace_id`` alone: nested LangGraph
-tool/LLM activity spans routinely share one OTel ``trace_id``, so a trace-only
-pin would collide across activities and reintroduce the very drift it aims to
-prevent. A completed stage with no matching pin (an operation whose start we
-never saw) falls back to the base resolver unchanged.
+Fix — and the boundary it respects: this runtime does NOT re-implement the hook
+path. It only supplies the RIGHT context. It pins the context resolved at
+STARTED, keyed by the SOURCE span's identity ``(trace_id, span_id, hook_type)``
+— NOT ``trace_id`` alone, because nested LangGraph tool/LLM activity spans share
+one OTel ``trace_id`` and a trace-only pin would collide across activities. At
+COMPLETED it BINDS that pinned context into the store (``activity_scope``) and
+delegates to the base ``HookRuntime.completed``, so Core builds, evaluates, and
+marks abort/halt all against the pinned activity — never the drifted store
+context. A completed stage with no matching pin defers to the base resolver
+unchanged.
 """
 
 from __future__ import annotations
 
-import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
 
+from openbox_core.context import activity_scope
 from openbox_core.contracts.context import ActivityContext
-from openbox_core.contracts.events import EventEnvelope, hook
-from openbox_core.contracts.otel_spans import HookType, Stage, from_otel_span
+from openbox_core.contracts.otel_spans import HookType
 from openbox_core.hooks.events import resolve_context
 from openbox_core.hooks.preflight import HookRuntime
 from openbox_core.otel.trace_context import raw_trace_id
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["LangGraphHookRuntime"]
 
@@ -59,9 +59,12 @@ class LangGraphHookRuntime(HookRuntime):
     Drop-in replacement installed via
     ``openbox_core.instrumentation.shared.set_hook_runtime`` after the base
     ``InstrumentationManager`` has installed the wrappers. Every base behavior
-    (gate evaluation, abort short-circuit, adapter enforcement, approval flow)
-    is inherited unchanged; only the context used to BUILD the completed hook
-    event is overridden — and only when a matching started pin exists.
+    (event assembly, gate evaluation, abort short-circuit, adapter enforcement,
+    approval flow, completed future-marks) is inherited unchanged; the only
+    override is WHICH ``ActivityContext`` the base runtime resolves at the
+    completed stage — the pinned one, bound via ``activity_scope`` so the base
+    ``resolve_context``'s ContextVar tier returns it before the drifting
+    trace-map fallback is ever consulted.
     """
 
     def __init__(self, runtime: Any) -> None:
@@ -105,10 +108,15 @@ class LangGraphHookRuntime(HookRuntime):
     def _pin_started(self, span: Any, hook_type: HookType) -> _PinKey | None:
         """Resolve + pin the started-stage context; return the key (or None).
 
-        Only pins a context that actually carries an activity binding — an
-        unbound context would be skipped by the base builder anyway, so
-        leaving it unpinned keeps completed on the identical (skip) path.
+        Only pins when preflight telemetry is enabled — a disabled preflight
+        sends no STARTED hook, so there is no started stage to correlate a
+        completed stage back to, and a pin would have no counterpart. Also
+        only pins a context that carries an activity binding — an unbound
+        context would be skipped by the base builder anyway, so leaving it
+        unpinned keeps completed on the identical (skip) path.
         """
+        if not self._runtime.config.instrumentation.preflight_enabled:
+            return None
         key = self._pin_key(span, hook_type)
         if key is None:
             return None
@@ -117,27 +125,6 @@ class LangGraphHookRuntime(HookRuntime):
             return None
         self._pin(key, ctx)
         return key
-
-    def _completed_event_with_ctx(
-        self,
-        span: Any,
-        hook_type: HookType,
-        fields: Mapping[str, Any] | None,
-        ctx: ActivityContext,
-    ) -> EventEnvelope | None:
-        """Mirror ``build_hook_event`` for the completed stage with an EXPLICIT
-        (pinned) context instead of re-resolving from the store."""
-        if not ctx.activity_id or not ctx.activity_type:
-            return None
-        envelope = from_otel_span(
-            span, stage=Stage.COMPLETED, hook_type=hook_type, activity_context=None, fields=fields
-        )
-        return hook(
-            activity_context=ctx.to_payload_fields(),
-            activity_id=ctx.activity_id,
-            activity_type=ctx.activity_type,
-            spans=[envelope],
-        )
 
     # ── Preflight (started): pin, then defer to base evaluation ───────────
 
@@ -183,7 +170,7 @@ class LangGraphHookRuntime(HookRuntime):
             self._unpin(key)
         return proceed
 
-    # ── Completed: reuse the pinned context, else base resolution ─────────
+    # ── Completed: bind the pinned context, then defer to the base runtime ─
 
     def completed(
         self,
@@ -192,22 +179,14 @@ class LangGraphHookRuntime(HookRuntime):
         hook_type: HookType,
         fields: Mapping[str, Any] | None = None,
     ) -> None:
-        if not self._runtime.config.instrumentation.completed_telemetry_enabled:
-            return
+        # Unpin FIRST — before the base runtime's completed-telemetry-enabled
+        # early return — so a pin can never leak on any exit path.
         ctx = self._unpin(self._pin_key(span, hook_type))
         if ctx is None:
-            # No started pin for this exact source span → base resolver.
             super().completed(span, hook_type=hook_type, fields=fields)
             return
-        event = self._completed_event_with_ctx(span, hook_type, fields, ctx)
-        if event is None:
-            return
-        try:
-            result = self._gate.completed(event)
-        except Exception:
-            logger.warning("completed-hook telemetry failed", exc_info=True)
-            return
-        self._after_completed(result, span)
+        with activity_scope(ctx, store=self._store):
+            super().completed(span, hook_type=hook_type, fields=fields)
 
     async def acompleted(
         self,
@@ -216,18 +195,9 @@ class LangGraphHookRuntime(HookRuntime):
         hook_type: HookType,
         fields: Mapping[str, Any] | None = None,
     ) -> None:
-        if not self._runtime.config.instrumentation.completed_telemetry_enabled:
-            return
         ctx = self._unpin(self._pin_key(span, hook_type))
         if ctx is None:
             await super().acompleted(span, hook_type=hook_type, fields=fields)
             return
-        event = self._completed_event_with_ctx(span, hook_type, fields, ctx)
-        if event is None:
-            return
-        try:
-            result = await self._gate.acompleted(event)
-        except Exception:
-            logger.warning("completed-hook telemetry failed", exc_info=True)
-            return
-        self._after_completed(result, span)
+        with activity_scope(ctx, store=self._store):
+            await super().acompleted(span, hook_type=hook_type, fields=fields)
