@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from openbox_core.client import check_expiration
 from openbox_core.contracts.results import EvaluationResult
 from openbox_core.contracts.results import Verdict as _CoreVerdict
+from openbox_core.errors import ContractError as _CoreContractError
+from openbox_core.errors import GovernanceAPIError as _CoreGovernanceAPIError
+from openbox_core.errors import OpenBoxNetworkError as _CoreOpenBoxNetworkError
 
+from openbox_langgraph.core_events import to_envelope
 from openbox_langgraph.errors import OpenBoxConfigError, OpenBoxNetworkError
 from openbox_langgraph.identity import (
     AgentIdentityConfig,
@@ -26,6 +30,9 @@ from openbox_langgraph.types import (
     parse_approval_response,
     to_server_event_type,
 )
+
+if TYPE_CHECKING:
+    from openbox_core.gate import GovernanceGate
 
 _SDK_VERSION = "0.2.0"
 
@@ -82,6 +89,48 @@ def _collapse_client_synthesized_fallback(
     if result.fallback_used and result.verdict is _CoreVerdict.ALLOW and not result.raw:
         return None
     return GovernanceVerdictResponse.from_result(result)
+
+
+async def _gate_evaluate(
+    gate: GovernanceGate, event: LangChainGovernanceEvent, on_api_error: str
+) -> GovernanceVerdictResponse | None:
+    """Evaluate one lifecycle event through the base SDK's strict gate.
+
+    The single translation seam between `gate.aevaluate`'s base-SDK contract
+    (`EvaluationResult`, `openbox_core` exceptions) and this SDK's own
+    (`GovernanceVerdictResponse | None`, `openbox_langgraph.errors`) — every
+    gate-routed call site in `evaluate_event` goes through this function so
+    the translation is defined exactly once. Outcome policy (mirrors the legacy
+    httpx path so the wired transport is behaviourally interchangeable):
+
+    - `EvaluationResult.fallback_allow()` (client-synthesized fail-open on a
+      NETWORK error): collapsed to `None` via the same discriminator used for
+      the legacy path, so the pre-screen-`None` -> callback re-evaluation ->
+      PII-redaction flow keeps firing regardless of which transport produced it.
+    - `ContractError` (a malformed envelope — a bug in THIS SDK's own
+      event->envelope mapping, raised pre-network by the strict gate, never
+      from a Core response): ALWAYS a fail-open telemetry-drop (`None`),
+      independent of `on_api_error`. Enforcing fail_closed here would let an
+      SDK-side mapping defect block a user's graph for a reason their OWN policy
+      never produced — strictly worse than dropping one governance event.
+    - `GovernanceAPIError` / `OpenBoxNetworkError` (network-shaped failure) ->
+      this SDK's `OpenBoxNetworkError`, same public exception the legacy path
+      raises under fail_closed.
+    - Any OTHER exception (e.g. a malformed Core 200 body the base parser
+      cannot decode) is a transport-shaped fault, NOT a governance verdict:
+      routed through `_network_fallback_result` so fail_open returns `None`
+      (never crash the graph on a Core hiccup) and fail_closed raises
+      `OpenBoxNetworkError` — matching the legacy httpx catch-all exactly.
+    """
+    try:
+        result = await gate.aevaluate(to_envelope(event))
+    except _CoreContractError:
+        return None
+    except (_CoreGovernanceAPIError, _CoreOpenBoxNetworkError) as e:
+        raise OpenBoxNetworkError(str(e)) from e
+    except Exception as e:
+        return _network_fallback_result(on_api_error, f"Governance gate error: {e}")
+    return _collapse_client_synthesized_fallback(result)
 
 
 def build_auth_headers(
@@ -143,6 +192,7 @@ class GovernanceClient:
         on_api_error: str = "fail_open",
         agent_did: str | None = None,
         agent_private_key: str | None = None,
+        gate: GovernanceGate | None = None,
     ) -> None:
         self._api_url = api_url.rstrip("/")
         self._api_key = api_key
@@ -154,9 +204,19 @@ class GovernanceClient:
             did=agent_did,
             private_key=agent_private_key,
         )
+        # Optional base-SDK gate. When wired (by the handler, from a core
+        # runtime built off the SAME api_url/api_key/timeout/on_api_error),
+        # `evaluate_event`'s ASYNC path routes lifecycle events through it
+        # instead of this client's own httpx transport — see `evaluate_event`.
+        # `None` (the default) preserves the exact legacy transport/serialization
+        # for every existing caller that constructs a bare `GovernanceClient()`.
+        # `evaluate_event_sync` (sync middleware hooks) is unaffected either way.
+        self._gate = gate
         # Deduplication: prevent sending the same (activity_id, event_type) twice
         # within the same workflow run. Keyed by (workflow_id, run_id) so it resets
-        # automatically on each new ainvoke() call.
+        # automatically on each new ainvoke() call. Shared by every evaluate_event
+        # call site regardless of which transport (gate or legacy httpx) is active
+        # for a given call — dedup is a client-level concern, not a transport one.
         self._dedup_run: tuple[str, str] | None = None
         self._dedup_sent: set[tuple[str, str]] = set()
 
@@ -242,13 +302,23 @@ class GovernanceClient:
         """Send a governance event to OpenBox Core and return the verdict.
 
         Returns `None` on network failure when `on_api_error` is `fail_open`.
-        Silently drops duplicate (activity_id, event_type) pairs within the same run.
+        Silently drops duplicate (activity_id, event_type) pairs within the same run
+        — this de-dup pre-check runs BEFORE either transport below, so it applies
+        identically whether a `gate` is wired or not.
+
+        When a `gate` was supplied at construction (see `__init__`), the event is
+        routed through the base SDK's `EventEnvelope` + `GovernanceGate.aevaluate`
+        instead of this client's own httpx transport — see `_gate_evaluate`.
+        Overriding `evaluate_event` in a subclass (e.g. the golden-fixture
+        harness's `RecordingGovernanceClient`) still fully intercepts either way,
+        since the branch lives inside THIS method, never at a call site.
 
         Args:
             event: The governance event payload to evaluate.
 
         Raises:
-            OpenBoxNetworkError: On network failure when `on_api_error` is `fail_closed`.
+            OpenBoxNetworkError: On network failure when `on_api_error` is `fail_closed`
+                (from either transport).
         """
         server_event_type = to_server_event_type(event.event_type)
         if event.activity_id and self._is_duplicate(
@@ -261,17 +331,21 @@ class GovernanceClient:
                 )
             return None
 
-        payload = event.to_dict()
-        payload["event_type"] = server_event_type
-        payload["task_queue"] = event.task_queue or "langgraph"
-        payload["source"] = "workflow-telemetry"
-
         if os.environ.get("OPENBOX_DEBUG") == "1":
             import json
 
             print(
-                f"[OpenBox Debug] governance request: {json.dumps(payload, indent=2, default=str)}"
+                f"[OpenBox Debug] governance request: "
+                f"{json.dumps(event.to_dict(), indent=2, default=str)}"
             )
+
+        if self._gate is not None:
+            return await _gate_evaluate(self._gate, event, self._on_api_error)
+
+        payload = event.to_dict()
+        payload["event_type"] = server_event_type
+        payload["task_queue"] = event.task_queue or "langgraph"
+        payload["source"] = "workflow-telemetry"
 
         try:
             client = self._get_client()

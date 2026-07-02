@@ -26,6 +26,7 @@ from opentelemetry import trace as otel_trace
 
 from openbox_langgraph.client import GovernanceClient
 from openbox_langgraph.config import GovernanceConfig, get_global_config, merge_config
+from openbox_langgraph.core_runtime import create_core_runtime
 from openbox_langgraph.errors import (
     ApprovalExpiredError,
     ApprovalRejectedError,
@@ -405,9 +406,33 @@ class OpenBoxLangGraphHandler:
         })
 
         if opts.client:
+            # Injected client (e.g. a test double, or a subclass overriding
+            # evaluate_event) is used exactly as given — no core runtime/gate
+            # is built or wired here. This is the F2 seam: an injected client's
+            # OWN evaluate_event override still intercepts every governance
+            # call the handler makes, unaffected by the gate-routing below.
             self._client = opts.client
+            self._core_runtime = None
         else:
             gc = get_global_config()
+            # Own core runtime, own private ContextStore (create_core_runtime's
+            # isolation guarantee) — built from the SAME resolved
+            # api_url/api_key/timeout/on_api_error/agent_did/agent_private_key
+            # the legacy GovernanceClient below is constructed from, so the
+            # gate evaluates against the identical Core endpoint/identity.
+            # Built eagerly (not lazily on first evaluate_event call) because
+            # `create_core_runtime` performs no network I/O — only config
+            # resolution/validation and identity loading, both cheap and both
+            # already required (get_global_config() was itself populated by an
+            # earlier `initialize()` call that already validated these values).
+            self._core_runtime = create_core_runtime(
+                self._config,
+                api_url=gc.api_url,
+                api_key=gc.api_key,
+                governance_timeout=gc.governance_timeout,
+                agent_did=gc.agent_did,
+                agent_private_key=gc.agent_private_key,
+            )
             self._client = GovernanceClient(
                 api_url=gc.api_url,
                 api_key=gc.api_key,
@@ -415,6 +440,7 @@ class OpenBoxLangGraphHandler:
                 on_api_error=self._config.on_api_error,
                 agent_did=gc.agent_did,
                 agent_private_key=gc.agent_private_key,
+                gate=self._core_runtime.gate,
             )
 
         # Setup OTel HTTP governance hooks (required)
