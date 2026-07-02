@@ -43,6 +43,7 @@ from openbox_langgraph.errors import (
     GuardrailsValidationError,
 )
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
+from openbox_langgraph.tool_activity_scope import turn_metadata, wrap_graph_tools
 from openbox_langgraph.types import (
     GovernanceVerdictResponse,
     LangChainGovernanceEvent,
@@ -472,6 +473,19 @@ class OpenBoxLangGraphHandler:
                 agent_private_key=gc.agent_private_key,
                 gate=self._core_runtime.gate,
             )
+            # Bind the base-SDK ActivityContext around ACTUAL tool execution:
+            # wrap each tool so its body runs inside activity_scope on this
+            # runtime's private store. Hooks fired inside a tool then resolve to
+            # that tool via the ContextVar tier (the primary mechanism), instead
+            # of the trace-lookup fallback. Best-effort + idempotent; injected-
+            # client (lifecycle-only) handlers skip this — they own no store.
+            if graph is not None:
+                wrap_graph_tools(
+                    graph,
+                    core_runtime=self._core_runtime,
+                    config=self._config,
+                    resolve_tool_type=lambda name: self._resolve_tool_type(name, None),
+                )
 
     # ─────────────────────────────────────────────────────────────
     # Pre-screen: enforce guardrails before stream starts
@@ -681,6 +695,48 @@ class OpenBoxLangGraphHandler:
         if reset is not None:
             reset(workflow_id)
 
+    def _governed_config(
+        self,
+        config: dict[str, Any] | None,
+        *,
+        workflow_id: str,
+        run_id: str,
+        thread_id: str,
+        pre_screen_response: GovernanceVerdictResponse | None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Build the RunnableConfig with this turn's guardrails callback.
+
+        The ``_GuardrailsCallbackHandler`` does pre-LLM PII redaction and owns
+        ``llm_activity_map`` (returned so ``_process_event`` can route the
+        LLMCompleted close to the right activity row).
+
+        Note: tool-execution ``ActivityContext`` binding is NOT done via a
+        callback — LangChain isolates callback context from the tool body, so a
+        callback bind never reaches the hooks. It is done by wrapping the graph's
+        tools (see ``tool_activity_scope``); this method threads the per-turn
+        ids down to those wrappers via ``config["metadata"]`` (a per-invocation
+        channel, concurrency-safe — unlike a shared module ContextVar).
+        """
+        llm_activity_map: dict[str, str] = {}
+        guardrails_cb = _GuardrailsCallbackHandler(
+            client=self._client,
+            config=self._config,
+            workflow_id=workflow_id,
+            run_id=run_id,
+            thread_id=thread_id,
+            pre_screen_response=pre_screen_response,
+            pre_screen_activity_id=f"{run_id}-pre" if pre_screen_response is not None else None,
+            llm_activity_map=llm_activity_map,
+        )
+        cfg = dict(config or {})
+        cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
+        # Carry this turn's ids to the wrapped tools via their own RunnableConfig
+        # (LangGraph propagates metadata down to each tool). Only when a core
+        # runtime owns a store to bind on; merged so user metadata survives.
+        if self._core_runtime is not None:
+            cfg["metadata"] = {**(cfg.get("metadata") or {}), **turn_metadata(workflow_id, run_id)}
+        return cfg, llm_activity_map
+
     # ─────────────────────────────────────────────────────────────
     # Public invoke / ainvoke
     # ─────────────────────────────────────────────────────────────
@@ -724,23 +780,13 @@ class OpenBoxLangGraphHandler:
             input, workflow_id, run_id
         )
 
-        # Shared map: LangChain callback UUID → activity_id to use for the LLM span hook.
-        # Written by _GuardrailsCallbackHandler.on_chat_model_start, read by _process_event.
-        llm_activity_map: dict[str, str] = {}
-
-        # Inject guardrails callback for PII redaction only (in-place message mutation).
-        guardrails_cb = _GuardrailsCallbackHandler(
-            client=self._client,
-            config=self._config,
+        cfg, llm_activity_map = self._governed_config(
+            config,
             workflow_id=workflow_id,
             run_id=run_id,
             thread_id=thread_id,
             pre_screen_response=pre_screen_response,
-            pre_screen_activity_id=f"{run_id}-pre" if pre_screen_response is not None else None,
-            llm_activity_map=llm_activity_map,
         )
-        cfg = dict(config or {})
-        cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
 
         try:
             async for event in self._graph.astream_events(
@@ -823,19 +869,13 @@ class OpenBoxLangGraphHandler:
             input, workflow_id, run_id
         )
 
-        llm_activity_map: dict[str, str] = {}
-        guardrails_cb = _GuardrailsCallbackHandler(
-            client=self._client,
-            config=self._config,
+        cfg, llm_activity_map = self._governed_config(
+            config,
             workflow_id=workflow_id,
             run_id=run_id,
             thread_id=thread_id,
             pre_screen_response=pre_screen_response,
-            pre_screen_activity_id=f"{run_id}-pre" if pre_screen_response is not None else None,
-            llm_activity_map=llm_activity_map,
         )
-        cfg = dict(config or {})
-        cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
 
         _debug = os.environ.get("OPENBOX_DEBUG") == "1"
         try:
@@ -919,19 +959,13 @@ class OpenBoxLangGraphHandler:
             input, workflow_id, run_id
         )
 
-        llm_activity_map: dict[str, str] = {}
-        guardrails_cb = _GuardrailsCallbackHandler(
-            client=self._client,
-            config=self._config,
+        cfg, llm_activity_map = self._governed_config(
+            config,
             workflow_id=workflow_id,
             run_id=run_id,
             thread_id=thread_id,
             pre_screen_response=pre_screen_response,
-            pre_screen_activity_id=f"{run_id}-pre" if pre_screen_response is not None else None,
-            llm_activity_map=llm_activity_map,
         )
-        cfg = dict(config or {})
-        cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
 
         try:
             async for event in self._graph.astream_events(
