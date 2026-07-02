@@ -80,6 +80,13 @@ class GovernanceConfig:
     skip_tool_types: set[str] = field(default_factory=set)
     hitl: HITLConfig = field(default_factory=HITLConfig)
     session_id: str | None = None
+    multi_agent_session_id: str | None = None
+    """Optional multi-agent session correlation id, distinct from `session_id`.
+
+    Threaded onto the base SDK's `ActivityContext.multi_agent_session_id` at
+    activity-boundary dual-write registration — never mixed into `session_id`,
+    which stays the single-agent chat-session identifier the legacy governance
+    events already carry."""
     agent_name: str | None = None
     task_queue: str = "langgraph"
     use_native_interrupt: bool = False
@@ -146,6 +153,7 @@ def merge_config(partial: dict[str, Any] | None = None) -> GovernanceConfig:
         skip_tool_types=_to_set(partial.get("skip_tool_types")),
         hitl=hitl,
         session_id=partial.get("session_id"),
+        multi_agent_session_id=partial.get("multi_agent_session_id"),
         agent_name=partial.get("agent_name"),
         task_queue=partial.get("task_queue", "langgraph"),
         use_native_interrupt=partial.get("use_native_interrupt", False),

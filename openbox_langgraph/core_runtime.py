@@ -16,6 +16,12 @@ Two isolation guarantees matter here:
   ``EvaluationClient`` with ``config.load_identity()``, so a signed LangGraph
   configuration keeps signing base-SDK requests — never a silent downgrade to
   bare-Bearer at the trust boundary.
+
+The trace-lookup fallback shim (``TraceContextRegistry``, ``ContextMissMetrics``,
+``get_trace_registry``, ``get_context_store``) that resolves a runtime's
+private ``ContextStore`` for a spawned LangGraph tool/LLM task lives in
+``trace_context_registry.py`` — re-exported here so existing callers of
+``openbox_langgraph.core_runtime`` do not need an import-path change.
 """
 
 from __future__ import annotations
@@ -25,10 +31,25 @@ from openbox_core.context import ContextStore
 from openbox_core.runtime import OpenBoxRuntime
 
 from openbox_langgraph.config import GovernanceConfig
+from openbox_langgraph.trace_context_registry import (
+    ContextMissMetrics,
+    TraceContextRegistry,
+    get_context_store,
+    get_trace_registry,
+)
 
 # SDK-specific env namespace. Resolution order is explicit > OPENBOX_LANGGRAPH_*
 # > OPENBOX_* > defaults (handled by OpenBoxConfig.resolve).
 CORE_ENV_PREFIX = "OPENBOX_LANGGRAPH"
+
+__all__ = [
+    "CORE_ENV_PREFIX",
+    "ContextMissMetrics",
+    "TraceContextRegistry",
+    "create_core_runtime",
+    "get_context_store",
+    "get_trace_registry",
+]
 
 
 def create_core_runtime(
