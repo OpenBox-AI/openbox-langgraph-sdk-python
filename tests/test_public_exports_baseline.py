@@ -14,6 +14,8 @@ snapshot can never drift from an alias that no longer resolves.
 
 from __future__ import annotations
 
+import pytest
+
 import openbox_langgraph
 
 # Frozen snapshot of the public surface. Update ONLY when an export is added or
@@ -101,3 +103,13 @@ def test_all_has_no_duplicates() -> None:
     # Public surface is 56 (55 baseline exports + __version__); a change here is
     # a deliberate surface change.
     assert len(EXPECTED_EXPORTS) == 56
+
+
+def test_legacy_otel_setup_export_is_a_raising_shim() -> None:
+    """`setup_opentelemetry_for_governance` stays exported (surface stability)
+    but is now a deprecated shim: legacy in-repo hook governance was removed,
+    so calling it raises rather than silently installing nothing."""
+    from openbox_langgraph.errors import OpenBoxConfigError
+
+    with pytest.raises(OpenBoxConfigError):
+        openbox_langgraph.setup_opentelemetry_for_governance()

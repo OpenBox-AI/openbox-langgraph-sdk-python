@@ -1,9 +1,11 @@
-"""Opt-in construction of a base-SDK ``OpenBoxRuntime`` for LangGraph.
+"""Construction of a base-SDK ``OpenBoxRuntime`` for LangGraph.
 
 Builds an :class:`openbox_core.runtime.OpenBoxRuntime` from the LangGraph
-configuration surface WITHOUT changing any default behavior. Nothing here runs
-unless a caller explicitly constructs a runtime; the legacy ``GovernanceClient``
-plus in-repo hooks remain the only default execution path.
+configuration surface. The base ``openbox_core`` InstrumentationManager is the
+ONLY hook runtime — there is no legacy in-repo hook fallback. A handler that
+owns its own runtime (non-injected-client path) always routes hook governance
+through this runtime; ``create_core_runtime`` fails fast when hook governance
+is opted out rather than silently arming nothing.
 
 Two isolation guarantees matter here:
 
@@ -34,22 +36,17 @@ union this makes possible.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from openbox_core.config import OpenBoxConfig
-from openbox_core.context import ContextStore
 from openbox_core.runtime import OpenBoxRuntime
 
 from openbox_langgraph.config import GovernanceConfig
+from openbox_langgraph.errors import OpenBoxConfigError
 from openbox_langgraph.trace_context_registry import (
     ContextMissMetrics,
     TraceContextRegistry,
     get_context_store,
     get_trace_registry,
 )
-
-if TYPE_CHECKING:
-    from openbox_langgraph.span_processor import WorkflowSpanProcessor
 
 # SDK-specific env namespace. Resolution order is explicit > OPENBOX_LANGGRAPH_*
 # > OPENBOX_* > defaults (handled by OpenBoxConfig.resolve).
@@ -73,7 +70,6 @@ def create_core_runtime(
     governance_timeout: float | None = None,
     agent_did: str | None = None,
     agent_private_key: str | None = None,
-    legacy_span_processor: WorkflowSpanProcessor | None = None,
     extra_ignored_urls: set[str] | None = None,
 ) -> OpenBoxRuntime:
     """Resolve base-SDK config and build an isolated ``OpenBoxRuntime``.
@@ -83,19 +79,18 @@ def create_core_runtime(
     DID/private-key both-or-neither rule. Explicit ``None`` arguments fall
     through to the env layers rather than overriding them.
 
-    ``config.use_core_instrumentation=False`` (the default): no adapter and no
-    instrumentation are wired — construction performs no network I/O and the
-    returned runtime is inert until a caller does something with it (matches
-    every caller that predates the opt-in hook runtime).
+    ``config.use_core_instrumentation=False``: raises ``OpenBoxConfigError``.
+    Legacy in-repo hook governance has been removed, so a runtime that arms no
+    hook instrumentation would silently govern nothing — refused rather than
+    returned inert.
 
-    ``config.use_core_instrumentation=True``: the runtime is fully armed —
+    ``config.use_core_instrumentation=True`` (the default): the runtime is fully armed —
 
     * ``context_store`` is a :class:`~openbox_langgraph.fallback_context_store.FallbackContextStore`
       (exact-trace lookup, falling through to the single-active/last-registered
       tiers on a miss — see that module for why the base SDK needs this).
     * ``adapter`` is a :class:`~openbox_langgraph.core_adapter.LangGraphFrameworkAdapter`
-      bound to the SAME store (+ ``legacy_span_processor``, when given, for the
-      post-approval reset that keeps both governance stores in sync).
+      bound to the SAME store.
     * Base instrumentation (HTTP/DB/file/function wrappers) is installed
       before this function returns, via an ``InstrumentationManager``
       constructed directly (mirroring ``openbox_core.conformance.instrumentation``)
@@ -103,14 +98,18 @@ def create_core_runtime(
       can be threaded through — the manager's self-instrumentation guard then
       ignores every URL EITHER side already ignores, a true union rather than
       whichever set happened to be configured last.
-    * ``runtime.config.api_url`` reuses ``get_or_create_tracer_provider``'s
-      existing-provider-wins behavior: the legacy ``setup_opentelemetry_for_governance``
-      call in ``langgraph_handler.py`` runs immediately after this function
-      returns and installs the SAME check (create only if the global provider
-      isn't already an SDK ``TracerProvider``) — so exactly one provider ever
-      exists in the process regardless of which of the two setup calls runs
-      first.
     """
+    if not config.use_core_instrumentation:
+        # No legacy hook fallback exists anymore — the base openbox_core
+        # InstrumentationManager is the ONLY hook runtime. Opting out cannot
+        # silently degrade to legacy hooks, so refuse to build a runtime that
+        # would arm no hook governance at all.
+        raise OpenBoxConfigError(
+            "use_core_instrumentation=False is no longer supported: legacy in-repo "
+            "hook governance has been removed and openbox_core base instrumentation "
+            "is the only hook runtime. Set use_core_instrumentation=True (the default)."
+        )
+
     core_config = OpenBoxConfig.resolve(
         env_prefix=CORE_ENV_PREFIX,
         api_url=api_url,
@@ -122,8 +121,6 @@ def create_core_runtime(
         agent_private_key=agent_private_key,
         validate=True,
     )
-    if not config.use_core_instrumentation:
-        return OpenBoxRuntime(core_config, context_store=ContextStore())
 
     from openbox_core.instrumentation.manager import InstrumentationManager
 
@@ -131,7 +128,7 @@ def create_core_runtime(
     from openbox_langgraph.fallback_context_store import FallbackContextStore
 
     store = FallbackContextStore()
-    adapter = LangGraphFrameworkAdapter(legacy_span_processor, context_store=store)
+    adapter = LangGraphFrameworkAdapter(context_store=store)
     runtime = OpenBoxRuntime(core_config, adapter, context_store=store)
     manager = InstrumentationManager(runtime, extra_ignored_urls=extra_ignored_urls)
     # Same pattern the base SDK's own conformance kit uses

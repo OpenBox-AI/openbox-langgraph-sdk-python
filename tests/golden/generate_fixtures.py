@@ -2,7 +2,7 @@
 
 Run with:  uv run --extra dev python3 -m tests.golden.generate_fixtures
 
-This script drives the REAL `GovernanceClient` / `hook_governance` /
+This script drives the REAL `GovernanceClient` /
 `OpenBoxLangGraphHandler` code paths (mock HTTP transport only, plus a
 client-injection seam for the full-graph scenarios — see capture_harness.py
 / graph_capture_harness.py) and writes out the exact wire bodies, headers,
@@ -45,7 +45,6 @@ from .fake_agent_graphs import (
     build_two_llm_call_graph,
 )
 from .graph_capture_harness import run_ordered_capture
-from .hook_trigger_fixture import capture_hook_trigger_fixture
 from .layer1_handbuilt_pins import capture_handbuilt_pin_bodies
 from .real_emitted_event_fixtures import (
     capture_real_emitted_baseline_bodies,
@@ -116,7 +115,6 @@ async def main() -> None:
     await capture_real_emitted_subagent_tool_bodies()
     await capture_real_emitted_error_close_body()
     await capture_handbuilt_pin_bodies()
-    await capture_hook_trigger_fixture()
 
     # Layer 2: headers.
     await _capture_layer2_headers()

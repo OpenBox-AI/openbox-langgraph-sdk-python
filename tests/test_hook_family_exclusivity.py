@@ -1,41 +1,24 @@
-"""Hybrid exclusivity (Part D/E): under `use_core_instrumentation=True`, a
-base-covered family (HTTP) gets EXACTLY ONE governance evaluation per
-operation stage — never zero (a silent last-writer-wins gap) and never two
-(a silent double-evaluation from both legacy and base actively governing the
-SAME request).
+"""Base instrumentation governs a covered family (HTTP) EXACTLY ONCE per
+operation stage — never zero (a silent gap) and never twice (a double
+evaluation). With the legacy in-repo hooks removed, base `openbox_core`
+instrumentation is the ONLY hook runtime, so this test proves it is installed
+exactly once and no second layer re-governs the same request.
 
 Drives the REAL `OpenBoxLangGraphHandler.__init__` non-injected-client path
-(the only path that wires legacy `setup_opentelemetry_for_governance` AND
-`create_core_runtime`'s base instrumentation together) so the
-`skip_families` switchboard in `otel_setup.py` is exercised for real, not
-re-implemented as a mock.
+(the only path that wires `create_core_runtime`'s base instrumentation) so
+installation is exercised for real, not re-implemented as a mock.
 
 TWO separate local servers are required, not one: the governance API and the
 "real operation" endpoint must live on DIFFERENT host:port pairs, because
-both legacy's `_should_ignore_url` and base's `should_ignore_url` treat any
-URL sharing the configured `api_url` prefix as self-instrumentation and
-silently skip it — a single shared server would make every "operation"
-request also match the ignored-URL guard and report zero evaluations
-regardless of whether exclusivity is actually correct.
+base's `should_ignore_url` treats any URL sharing the configured `api_url`
+prefix as self-instrumentation and silently skips it — a single shared server
+would make every "operation" request also match the ignored-URL guard and
+report zero evaluations regardless of correctness.
 
 Exercises `asyncio.create_task` topology (LangGraph's actual tool-execution
 shape — see `trace_context_registry.py`'s module docstring) to prove
 exclusivity holds under the SAME execution pattern the fallback-shim tests
 document as the hard case for context resolution.
-
-Deliberately does NOT include a flag-OFF "legacy governs alone" sanity check
-in this module: `setup_httpx_body_capture` permanently monkeypatches
-`httpx.Client.send`/`httpx.AsyncClient.send` at the CLASS level with no
-restore path in `otel_setup.uninstrument_all()` (a pre-existing legacy gap,
-confirmed empirically — `RequestsInstrumentor().uninstrument()` alone does
-not fully undo it either), so driving that path here would leak permanent
-global monkeypatches into every later test in the same pytest session. The
-flag-OFF default path already has exhaustive coverage elsewhere (the full
-legacy-only test suite plus the golden-fixture empty-diff gate); only the flag-ON
-exclusivity claim needs new coverage, and the flag-ON path here cleans up
-completely (base's `uninstall_instrumentation()` fully reverses its own
-installs; legacy's HTTP setup is never installed at all when the flag is on,
-per the `skip_families` switchboard).
 """
 
 from __future__ import annotations
@@ -54,7 +37,6 @@ pytest.importorskip("openbox_core")
 from openbox_core.context import activity_scope
 from openbox_core.contracts.context import ActivityContext
 
-from openbox_langgraph import otel_setup
 from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     create_openbox_graph_handler,
@@ -157,11 +139,10 @@ def governance_api():
 
 
 def _teardown_handler(handler: OpenBoxLangGraphHandler) -> None:
-    """Uninstall BOTH instrumentation layers so this test never leaks global
-    OTel/hook-governance state into a later test in the same session."""
+    """Uninstall base instrumentation so this test never leaks global OTel/hook
+    state into a later test in the same session."""
     if handler._core_runtime is not None:  # type: ignore[attr-defined]
         handler._core_runtime.uninstall_instrumentation()  # type: ignore[attr-defined]
-    otel_setup.uninstrument_all()
 
 
 class TestHttpFamilyExclusivityUnderFlag:

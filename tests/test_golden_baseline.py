@@ -1,8 +1,7 @@
 """Baseline oracle for wire-payload parity: asserts the golden fixtures under
 tests/golden/ exist, are non-empty, and pin the invariants a future refactor
-must preserve (hook body carries hook_trigger + spans, signed/unsigned runs
-carry the expected identity header sets, real-emitted bodies have the shape
-the real handler actually constructs).
+must preserve (signed/unsigned runs carry the expected identity header sets,
+real-emitted bodies have the shape the real handler actually constructs).
 
 Almost all Layer 1 wire-body fixtures were captured from a REAL
 `OpenBoxLangGraphHandler.ainvoke()` run (fake chat model, injected recording
@@ -52,7 +51,6 @@ _WIRE_BODY_EVENTS = [
     "subagent_tool_completed",
     "chain_completed",
     "workflow_completed_error_close",
-    "hook_trigger",  # real-emitted via hook_governance.evaluate_sync
     # Hand-built pins: no real construction site exists for these (verified —
     # see layer1_handbuilt_pins.py docstring for why each is infeasible).
     "chain_started.handbuilt_serialization_pin",
@@ -101,14 +99,6 @@ def test_ordering_fixture_exists_and_nonempty(fixture_name: str) -> None:
     for entry in ordered:
         assert "event_type" in entry
         assert "activity_id" in entry
-
-
-def test_hook_trigger_body_has_hook_trigger_true_and_nonempty_spans() -> None:
-    """The hook-level wire body must carry hook_trigger:true and non-empty spans."""
-    raw = _load("hook_trigger.raw.json")
-    assert raw["hook_trigger"] is True
-    assert raw["spans"], "hook body spans must be non-empty"
-    assert raw["span_count"] >= 1
 
 
 def test_llm_completed_is_plain_activity_completed_with_no_spans() -> None:

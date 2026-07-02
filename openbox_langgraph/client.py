@@ -143,7 +143,7 @@ def build_auth_headers(
 ) -> dict[str, str]:
     """Build standard auth headers for governance API calls.
 
-    Single source of truth — used by GovernanceClient and hook_governance.
+    Single source of truth for the SDK's outbound governance requests.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",

@@ -26,12 +26,23 @@ from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     OpenBoxLangGraphHandlerOptions,
 )
-from openbox_langgraph.span_processor import WorkflowSpanProcessor
 from openbox_langgraph.types import GovernanceVerdictResponse, Verdict
 from tests.golden.fake_agent_graphs import build_tool_call_graph
 
 # NOTE: the `_unconfigured_global_state` (autouse) and `_ensure_recording_tracer_provider`
 # fixtures this module depends on live in `tests/conftest.py`.
+
+# Every core runtime built by the helper installs base instrumentation (the
+# only hook runtime); close them all at teardown so no global hook state leaks
+# into a later test in the same session.
+_created_runtimes: list[Any] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_created_runtimes() -> Any:
+    yield
+    while _created_runtimes:
+        _created_runtimes.pop().close()
 
 
 class _AgentState(TypedDict):
@@ -50,8 +61,8 @@ class _AllowEverythingClient(GovernanceClient):
 
 def _build_handler_with_core_runtime() -> OpenBoxLangGraphHandler:
     """Same technique as the other context-binding test modules: injected
-    client avoids `initialize()`'s global OTel side effects; `_core_runtime`/
-    `_span_processor` assigned directly afterward."""
+    client avoids building a core runtime in `__init__`; `_core_runtime` is
+    assigned directly afterward (registered for teardown close)."""
     handler = OpenBoxLangGraphHandler(
         graph=None, options=OpenBoxLangGraphHandlerOptions(client=_AllowEverythingClient())
     )
@@ -61,7 +72,7 @@ def _build_handler_with_core_runtime() -> OpenBoxLangGraphHandler:
         api_key="obx_test_abc",
         governance_timeout=30.0,
     )
-    handler._span_processor = WorkflowSpanProcessor()  # type: ignore[attr-defined]
+    _created_runtimes.append(handler._core_runtime)  # type: ignore[attr-defined]
     return handler
 
 

@@ -1,14 +1,12 @@
-"""Core type parsing and hook-governance payload tests."""
+"""Core type parsing / verdict / serialization tests.
+
+Hook-governance payload tests were removed with the legacy in-repo hook
+modules — hook payload shape + evaluation is now owned entirely by the base
+``openbox_core`` instrumentation.
+"""
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import MagicMock
-
-import pytest
-
-from openbox_langgraph import hook_governance
-from openbox_langgraph.errors import GovernanceBlockedError
 from openbox_langgraph.types import (
     GovernanceVerdictResponse,
     LangChainGovernanceEvent,
@@ -26,52 +24,6 @@ from openbox_langgraph.types import (
     verdict_requires_approval,
     verdict_should_stop,
 )
-
-
-class _Context:
-    span_id = 0xABCD
-    trace_id = 0x1234
-
-
-class _Parent:
-    span_id = 0x9999
-
-
-class _Span:
-    parent = _Parent()
-
-    def get_span_context(self) -> _Context:
-        return _Context()
-
-
-class _SpanProcessor:
-    def __init__(self) -> None:
-        self.aborts: list[tuple[str, str, str]] = []
-        self.halts: list[tuple[str, str, str]] = []
-
-    def get_activity_context_by_trace(self, _trace_id: int) -> dict[str, Any]:
-        return {
-            "workflow_id": "workflow-1",
-            "run_id": "run-1",
-            "activity_id": "activity-1",
-            "activity_type": "tool",
-            "workflow_type": "AgentWorkflow",
-            "task_queue": "langgraph",
-            "source": "workflow-telemetry",
-            "non_serializable": object(),
-        }
-
-    def get_activity_abort(self, workflow_id: str, activity_id: str) -> str | None:
-        for wf, activity, reason in self.aborts:
-            if wf == workflow_id and activity == activity_id:
-                return reason
-        return None
-
-    def set_activity_abort(self, workflow_id: str, activity_id: str, reason: str) -> None:
-        self.aborts.append((workflow_id, activity_id, reason))
-
-    def set_halt_requested(self, workflow_id: str, activity_id: str, reason: str) -> None:
-        self.halts.append((workflow_id, activity_id, reason))
 
 
 def test_verdict_helpers_and_event_type_mapping() -> None:
@@ -144,71 +96,3 @@ def test_response_parsers_and_safe_serialize() -> None:
     assert approval.expired
     assert rfc3339_now().endswith("Z")
     assert safe_serialize({"items": (1, object())})["items"][0] == 1
-
-
-def test_hook_governance_configuration_and_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-    processor = _SpanProcessor()
-    hook_governance.configure(
-        "https://core.openbox.test/",
-        "obx_test_key",
-        processor,  # type: ignore[arg-type]
-        api_timeout=5,
-        on_api_error=hook_governance.FAIL_CLOSED,
-    )
-
-    payload = hook_governance._build_payload(
-        _Span(),
-        {"hook_type": "http_request", "stage": "started"},
-    )
-    span_id, trace_id, parent_span_id = hook_governance.extract_span_context(_Span())
-
-    assert hook_governance.is_configured()
-    assert hook_governance.get_span_processor() is processor
-    assert payload is not None
-    assert payload["workflow_id"] == "workflow-1"
-    assert payload["hook_trigger"]
-    assert payload["spans"][0]["activity_id"] == "activity-1"
-    assert isinstance(payload["non_serializable"], str)
-    assert span_id == "000000000000abcd"
-    assert trace_id == "00000000000000000000000000001234"
-    assert parent_span_id == "0000000000009999"
-
-    monkeypatch.setattr(hook_governance, "_span_processor", None)
-    assert hook_governance._build_payload(_Span(), {}) is None
-
-
-def test_hook_governance_handles_verdicts_and_fail_closed() -> None:
-    processor = _SpanProcessor()
-    hook_governance.configure(
-        "https://core.openbox.test",
-        "obx_test_key",
-        processor,  # type: ignore[arg-type]
-        on_api_error=hook_governance.FAIL_CLOSED,
-    )
-
-    with pytest.raises(GovernanceBlockedError):
-        hook_governance._handle_verdict(
-            {"verdict": "halt", "reason": "stop now"},
-            "https://api.example.test",
-            _Span(),
-        )
-
-    assert processor.aborts == [("workflow-1", "activity-1", "stop now")]
-    assert processor.halts == [("workflow-1", "activity-1", "stop now")]
-
-    response = MagicMock(status_code=503)
-    with pytest.raises(GovernanceBlockedError):
-        hook_governance._send_and_handle(response, "https://api.example.test")
-
-
-def test_hook_governance_evaluate_sync_short_circuits_aborted_activity() -> None:
-    processor = _SpanProcessor()
-    processor.set_activity_abort("workflow-1", "activity-1", "approval required")
-    hook_governance.configure(
-        "https://core.openbox.test",
-        "obx_test_key",
-        processor,  # type: ignore[arg-type]
-    )
-
-    with pytest.raises(GovernanceBlockedError):
-        hook_governance.evaluate_sync(_Span(), "https://api.example.test", {})

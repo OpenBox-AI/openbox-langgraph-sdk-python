@@ -1,7 +1,7 @@
 """Reusable helpers for capturing real OpenBox LangGraph SDK wire payloads.
 
 This module is the baseline oracle for wire-payload parity: it drives the
-REAL `GovernanceClient` / `hook_governance` / `OpenBoxLangGraphHandler` code
+REAL `GovernanceClient` / `OpenBoxLangGraphHandler` code
 paths against a mock HTTP transport and records exactly what goes on the
 wire today. Nothing here simulates governance behavior — only the transport
 is faked, matching the existing test suite's convention (see

@@ -1,8 +1,10 @@
-"""Tests for ``create_core_runtime`` — the opt-in base-SDK runtime builder.
+"""Tests for ``create_core_runtime`` — the base-SDK runtime builder.
 
-Verifies layered config resolution + validation, DID identity preservation, and
-the private-store isolation guarantee. None of this touches the default
-execution path (legacy client + hooks); it only exercises the new opt-in seam.
+Verifies layered config resolution + validation, DID identity preservation, the
+private-store isolation guarantee, and the fail-fast when hook instrumentation
+is opted out. Base ``openbox_core`` instrumentation is the only hook runtime, so
+each runtime built here installs it — every test closes its runtime to uninstall
+(one open at a time to keep the global install/uninstall clean).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from openbox_core.runtime import OpenBoxRuntime
 
 from openbox_langgraph.config import GovernanceConfig
 from openbox_langgraph.core_runtime import create_core_runtime
+from openbox_langgraph.errors import OpenBoxConfigError
 
 # Non-real test key material (32-byte seed), same shape as test_did_client_signing.
 _PRIVATE_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
@@ -46,15 +49,31 @@ def _runtime(
     )
 
 
+def test_use_core_instrumentation_false_fails_fast() -> None:
+    """Opting out of hook instrumentation is refused — no legacy fallback exists."""
+    with pytest.raises(OpenBoxConfigError):
+        create_core_runtime(
+            GovernanceConfig(use_core_instrumentation=False),
+            api_url=_URL,
+            api_key=_KEY,
+        )
+
+
 def test_builds_runtime_with_private_store() -> None:
     """Each runtime owns a private store, never the process-global default."""
     rt = _runtime()
-    rt2 = _runtime()
     try:
-        assert rt.context_store is not default_context_store()
-        assert rt.context_store is not rt2.context_store
+        store1 = rt.context_store
+        assert store1 is not default_context_store()
     finally:
         rt.close()
+    # Second runtime built after the first fully closes — its store must still
+    # be a distinct private instance (never shared, never the global default).
+    rt2 = _runtime()
+    try:
+        assert rt2.context_store is not default_context_store()
+        assert rt2.context_store is not store1
+    finally:
         rt2.close()
 
 
@@ -95,10 +114,13 @@ def test_env_prefix_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENBOX_LANGGRAPH_API_URL", "https://prefixed.example.com")
 
     explicit = _runtime(api_url="https://explicit.example.com")
-    prefixed = _runtime(api_url=None)  # falls through to the env layers
     try:
         assert explicit.config.api_url == "https://explicit.example.com"
-        assert prefixed.config.api_url == "https://prefixed.example.com"
     finally:
         explicit.close()
+
+    prefixed = _runtime(api_url=None)  # falls through to the env layers
+    try:
+        assert prefixed.config.api_url == "https://prefixed.example.com"
+    finally:
         prefixed.close()

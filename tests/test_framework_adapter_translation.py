@@ -20,7 +20,6 @@ from openbox_core.contracts.results import EvaluationResult, Verdict
 
 from openbox_langgraph.core_adapter import LangGraphFrameworkAdapter
 from openbox_langgraph.errors import GovernanceBlockedError, GovernanceHaltError
-from openbox_langgraph.span_processor import WorkflowSpanProcessor
 
 _CTX = ActivityContext(
     workflow_id="wf-adapter-test",
@@ -192,26 +191,6 @@ class TestResetAfterApproval:
 
         adapter.reset_after_approval(_CTX.workflow_id)
 
-        assert not store.is_activity_aborted(_CTX.workflow_id, _CTX.activity_id)
-
-    def test_clears_legacy_span_processor_abort_mark_too(self) -> None:
-        legacy = WorkflowSpanProcessor()
-        legacy.set_activity_abort(_CTX.workflow_id, _CTX.activity_id, "needs approval")
-        store = ContextStore()
-        adapter = LangGraphFrameworkAdapter(legacy, context_store=store)
-        store.bind(_CTX)
-
-        adapter.reset_after_approval(_CTX.workflow_id)
-
-        assert legacy.get_activity_abort(_CTX.workflow_id, _CTX.activity_id) is None
-
-    def test_noop_without_legacy_span_processor(self) -> None:
-        adapter, store = _bound_adapter()
-        with pytest.raises(GovernanceBlockedError):
-            adapter.raise_hook_blocked(EvaluationResult(verdict=Verdict.BLOCK, reason="x"))
-        # No legacy processor was given to this adapter — must not raise
-        # trying to reach one.
-        adapter.reset_after_approval(_CTX.workflow_id)
         assert not store.is_activity_aborted(_CTX.workflow_id, _CTX.activity_id)
 
     def test_falsy_workflow_id_is_a_noop(self) -> None:

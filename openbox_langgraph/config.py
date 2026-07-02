@@ -90,10 +90,11 @@ class GovernanceConfig:
     agent_name: str | None = None
     task_queue: str = "langgraph"
     use_native_interrupt: bool = False
-    use_core_instrumentation: bool = False
-    """Experimental: route governance through the shared ``openbox_core`` hook
-    runtime instead of the legacy in-repo hooks. Default ``False`` keeps the
-    legacy path; inert until the opt-in core runtime is wired."""
+    use_core_instrumentation: bool = True
+    """Route hook governance through the shared ``openbox_core`` base
+    instrumentation — the only hook runtime. Default ``True``. Setting it
+    ``False`` fails fast (``OpenBoxConfigError``): legacy in-repo hook
+    governance has been removed, so there is nothing to fall back to."""
     root_node_names: set[str] = field(default_factory=set)
     tool_type_map: dict[str, str] = field(default_factory=dict)
     """Optional mapping of tool name → tool_type for execution tree classification.
@@ -157,7 +158,7 @@ def merge_config(partial: dict[str, Any] | None = None) -> GovernanceConfig:
         agent_name=partial.get("agent_name"),
         task_queue=partial.get("task_queue", "langgraph"),
         use_native_interrupt=partial.get("use_native_interrupt", False),
-        use_core_instrumentation=partial.get("use_core_instrumentation", False),
+        use_core_instrumentation=partial.get("use_core_instrumentation", True),
         root_node_names=_to_set(partial.get("root_node_names")),
         tool_type_map=tool_type_map,
     )
