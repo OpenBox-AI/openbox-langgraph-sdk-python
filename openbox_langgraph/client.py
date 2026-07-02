@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from datetime import UTC
 from typing import Any
 
 import httpx
+from openbox_core.client import check_expiration
+from openbox_core.contracts.results import EvaluationResult
+from openbox_core.contracts.results import Verdict as _CoreVerdict
 
 from openbox_langgraph.errors import OpenBoxConfigError, OpenBoxNetworkError
 from openbox_langgraph.identity import (
@@ -26,6 +28,60 @@ from openbox_langgraph.types import (
 )
 
 _SDK_VERSION = "0.2.0"
+
+
+def _network_fallback_result(on_api_error: str, msg: str) -> GovernanceVerdictResponse | None:
+    """Apply the `on_api_error` policy to a NETWORK/transport failure.
+
+    This is the ONLY place a `GovernanceClient` verdict call may return
+    `None` — it corresponds exactly to a client-synthesized fallback
+    (`EvaluationResult.fallback_allow`): `verdict=ALLOW`, `fallback_used=True`,
+    and an EMPTY `raw` dict (nothing was ever parsed from a real body).
+
+    A response BODY that happens to be `{"verdict": "block",
+    "fallback_used": true}` never reaches this function — it is parsed by
+    `_verdict_from_response_data` instead, whose `raw` is always the
+    non-empty parsed dict, so the None-collapse below can never fire for it
+    and the BLOCK is enforced normally.
+
+    `msg` is the caller's fully-formatted message (kept caller-side so the
+    two distinct failure messages — "Governance API error: HTTP {status}"
+    for a bad response, "Governance API unreachable: {e}" for a raised
+    exception — stay exactly as they were before this translation layer).
+    """
+    if on_api_error == "fail_closed":
+        raise OpenBoxNetworkError(msg)
+    result = EvaluationResult.fallback_allow(msg)
+    return _collapse_client_synthesized_fallback(result)
+
+
+def _verdict_from_response_data(data: dict[str, Any]) -> GovernanceVerdictResponse:
+    """Parse a real HTTP response body into a `GovernanceVerdictResponse`.
+
+    Routed through the base SDK's `EvaluationResult.from_dict` so `raw` is
+    always the full parsed body — the non-empty `raw` is exactly what keeps
+    `_collapse_client_synthesized_fallback` from ever mistaking a real
+    (even oddly-shaped) Core response for a client-side fallback.
+    """
+    return GovernanceVerdictResponse.from_result(EvaluationResult.from_dict(data))
+
+
+def _collapse_client_synthesized_fallback(
+    result: EvaluationResult,
+) -> GovernanceVerdictResponse | None:
+    """Return `None` ONLY for a client-synthesized fail-open fallback.
+
+    The three-part discriminator matches `EvaluationResult.fallback_allow`
+    exactly and nothing else: `fallback_used=True` AND `verdict is ALLOW` AND
+    `raw` is empty (no real body was ever parsed). A response body that
+    happens to carry `fallback_used: true` alongside a blocking verdict, or
+    alongside ALLOW but WITH a real (non-empty) body, is a real Core response
+    and must be returned as a `GovernanceVerdictResponse` so callers enforce
+    it — never silently collapsed to `None`/implicit-ALLOW.
+    """
+    if result.fallback_used and result.verdict is _CoreVerdict.ALLOW and not result.raw:
+        return None
+    return GovernanceVerdictResponse.from_result(result)
 
 
 def build_auth_headers(
@@ -231,21 +287,19 @@ class GovernanceClient:
             )
 
             if not response.is_success:
-                if self._on_api_error == "fail_closed":
-                    msg = f"Governance API error: HTTP {response.status_code}"
-                    raise OpenBoxNetworkError(msg)
-                return None
+                return _network_fallback_result(
+                    self._on_api_error, f"Governance API error: HTTP {response.status_code}"
+                )
 
             data = response.json()
-            return GovernanceVerdictResponse.from_dict(data)
+            return _verdict_from_response_data(data)
 
         except OpenBoxNetworkError:
             raise
         except Exception as e:
-            if self._on_api_error == "fail_closed":
-                msg = f"Governance API unreachable: {e}"
-                raise OpenBoxNetworkError(msg) from e
-            return None
+            return _network_fallback_result(
+                self._on_api_error, f"Governance API unreachable: {e}"
+            )
 
     def evaluate_event_sync(
         self, event: LangChainGovernanceEvent
@@ -288,21 +342,19 @@ class GovernanceClient:
             )
 
             if not response.is_success:
-                if self._on_api_error == "fail_closed":
-                    msg = f"Governance API error: HTTP {response.status_code}"
-                    raise OpenBoxNetworkError(msg)
-                return None
+                return _network_fallback_result(
+                    self._on_api_error, f"Governance API error: HTTP {response.status_code}"
+                )
 
             data = response.json()
-            return GovernanceVerdictResponse.from_dict(data)
+            return _verdict_from_response_data(data)
 
         except OpenBoxNetworkError:
             raise
         except Exception as e:
-            if self._on_api_error == "fail_closed":
-                msg = f"Governance API unreachable: {e}"
-                raise OpenBoxNetworkError(msg) from e
-            return None
+            return _network_fallback_result(
+                self._on_api_error, f"Governance API unreachable: {e}"
+            )
 
     async def poll_approval(self, params: ApprovalPollParams) -> ApprovalResponse | None:
         """Poll for HITL approval status.
@@ -335,19 +387,15 @@ class GovernanceClient:
                 return None
 
             data = response.json()
-            parsed = parse_approval_response(data)
-
-            # SDK-side expiration check
-            if parsed.approval_expiration_time and not parsed.expired:
-                from datetime import datetime
-
-                expiry = datetime.fromisoformat(
-                    parsed.approval_expiration_time.replace("Z", "+00:00")
-                )
-                if expiry < datetime.now(tz=UTC):
-                    parsed.expired = True
-
-            return parsed
+            # SDK-side expiration check — run on the raw dict BEFORE parsing
+            # (matches openbox_core.client.check_expiration's own call order:
+            # check_expiration(data) then ApprovalResult.from_dict(data)).
+            # Handles ISO 'Z', ISO offset, and space-separated DB timestamp
+            # formats; a malformed timestamp is logged and left un-flagged
+            # rather than raised, so one bad timestamp string degrades to
+            # "expiration not confirmed" instead of aborting the whole poll.
+            check_expiration(data)
+            return parse_approval_response(data)
 
         except Exception:
             return None
