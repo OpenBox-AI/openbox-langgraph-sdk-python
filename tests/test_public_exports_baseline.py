@@ -20,6 +20,7 @@ import openbox_langgraph
 # removed on purpose (and call it out in the changelog).
 EXPECTED_EXPORTS = frozenset(
     {
+        "__version__",
         "DEFAULT_HITL_CONFIG",
         "AgentIdentityConfig",
         "ApprovalExpiredError",
@@ -97,5 +98,6 @@ def test_all_entries_are_importable() -> None:
 def test_all_has_no_duplicates() -> None:
     names = list(openbox_langgraph.__all__)
     assert len(names) == len(set(names)), "duplicate names in __all__"
-    # Baseline count is exactly 55; a change here is a deliberate surface change.
-    assert len(EXPECTED_EXPORTS) == 55
+    # Public surface is 56 (55 baseline exports + __version__); a change here is
+    # a deliberate surface change.
+    assert len(EXPECTED_EXPORTS) == 56
