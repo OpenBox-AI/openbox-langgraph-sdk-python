@@ -1,0 +1,29 @@
+{
+  "activity_id": "golden-baseline-body-run-run-81a84f28-pre-c",
+  "activity_output": {
+    "additional_kwargs": {},
+    "content": "hello from fake model",
+    "id": "lc_run--019f224c-efe1-7f42-ae9b-cf4c722d298d-0",
+    "invalid_tool_calls": [],
+    "name": null,
+    "response_metadata": {},
+    "tool_calls": [],
+    "type": "ai",
+    "usage_metadata": null
+  },
+  "activity_type": "llm_call",
+  "duration_ms": 0.615583997219801,
+  "event_type": "ActivityCompleted",
+  "has_tool_calls": false,
+  "hook_trigger": false,
+  "langgraph_node": "agent",
+  "langgraph_step": 1,
+  "llm_model": "FakeMessagesListChatModel",
+  "run_id": "golden-baseline-body-run-run-81a84f28",
+  "source": "workflow-telemetry",
+  "status": "completed",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.330Z",
+  "workflow_id": "golden-baseline-body-run-b65d7162",
+  "workflow_type": "LangGraphRun"
+}

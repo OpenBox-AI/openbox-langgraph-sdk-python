@@ -1,0 +1,60 @@
+{
+  "activity_id": "019f224c-efe0-7920-8336-e398ce3341ab",
+  "activity_output": {
+    "messages": [
+      {
+        "additional_kwargs": {},
+        "content": "hi",
+        "id": "386af88e-ab9c-449f-b39d-727033ed7bd5",
+        "name": null,
+        "response_metadata": {},
+        "type": "human"
+      },
+      {
+        "additional_kwargs": {},
+        "content": "hello from fake model",
+        "id": "lc_run--019f224c-efe1-7f42-ae9b-cf4c722d298d-0",
+        "invalid_tool_calls": [],
+        "name": null,
+        "response_metadata": {},
+        "tool_calls": [],
+        "type": "ai",
+        "usage_metadata": null
+      }
+    ]
+  },
+  "activity_type": "LangGraph",
+  "duration_ms": 1.781375002115965,
+  "event_type": "WorkflowCompleted",
+  "hook_trigger": false,
+  "run_id": "golden-baseline-body-run-run-81a84f28",
+  "source": "workflow-telemetry",
+  "status": "completed",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.331Z",
+  "workflow_id": "golden-baseline-body-run-b65d7162",
+  "workflow_output": {
+    "messages": [
+      {
+        "additional_kwargs": {},
+        "content": "hi",
+        "id": "386af88e-ab9c-449f-b39d-727033ed7bd5",
+        "name": null,
+        "response_metadata": {},
+        "type": "human"
+      },
+      {
+        "additional_kwargs": {},
+        "content": "hello from fake model",
+        "id": "lc_run--019f224c-efe1-7f42-ae9b-cf4c722d298d-0",
+        "invalid_tool_calls": [],
+        "name": null,
+        "response_metadata": {},
+        "tool_calls": [],
+        "type": "ai",
+        "usage_metadata": null
+      }
+    ]
+  },
+  "workflow_type": "LangGraph"
+}

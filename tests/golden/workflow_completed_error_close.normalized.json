@@ -1,0 +1,14 @@
+{
+  "activity_id": "<ID>-wf",
+  "activity_type": "LangGraphRun",
+  "error": "golden baseline error-close trigger",
+  "event_type": "WorkflowCompleted",
+  "hook_trigger": false,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "status": "failed",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

@@ -1,0 +1,17 @@
+{
+  "activity_id": "chain-run-1",
+  "activity_input": [
+    {
+      "messages": []
+    }
+  ],
+  "activity_type": "should_continue",
+  "event_type": "WorkflowStarted",
+  "hook_trigger": false,
+  "run_id": "thread-run-cf304772",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.343Z",
+  "workflow_id": "thread-88fad28a",
+  "workflow_type": "GoldenBaselineAgent"
+}

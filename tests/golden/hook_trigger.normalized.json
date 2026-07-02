@@ -1,0 +1,17 @@
+{
+  "activity_id": "golden-activity-1",
+  "event_type": "ActivityStarted",
+  "hook_trigger": true,
+  "run_id": "golden-run-1",
+  "span_count": 1,
+  "spans": [
+    {
+      "activity_id": "golden-activity-1",
+      "hook_type": "http",
+      "method": "GET",
+      "url": "https://example.com/api/resource"
+    }
+  ],
+  "timestamp": "<TS>",
+  "workflow_id": "golden-workflow-1"
+}

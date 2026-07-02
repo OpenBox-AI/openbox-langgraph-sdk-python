@@ -1,0 +1,26 @@
+{
+  "activity_id": "golden-baseline-body-run-run-81a84f28-wf",
+  "activity_input": [
+    {
+      "messages": [
+        {
+          "additional_kwargs": {},
+          "content": "hi",
+          "id": null,
+          "name": null,
+          "response_metadata": {},
+          "type": "human"
+        }
+      ]
+    }
+  ],
+  "activity_type": "LangGraphRun",
+  "event_type": "WorkflowStarted",
+  "hook_trigger": false,
+  "run_id": "golden-baseline-body-run-run-81a84f28",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.327Z",
+  "workflow_id": "golden-baseline-body-run-b65d7162",
+  "workflow_type": "LangGraphRun"
+}

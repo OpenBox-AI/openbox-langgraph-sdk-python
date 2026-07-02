@@ -1,0 +1,16 @@
+{
+  "activity_id": "thread-run-cf304772-wf",
+  "activity_type": "GoldenBaselineAgent",
+  "error": {
+    "message": "unrecoverable workflow error"
+  },
+  "event_type": "WorkflowFailed",
+  "hook_trigger": false,
+  "run_id": "thread-run-cf304772",
+  "source": "workflow-telemetry",
+  "status": "failed",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.343Z",
+  "workflow_id": "thread-88fad28a",
+  "workflow_type": "GoldenBaselineAgent"
+}
