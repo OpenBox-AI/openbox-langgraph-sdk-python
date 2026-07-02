@@ -343,13 +343,13 @@ class OpenBoxLangGraphHandlerOptions:
     agent_name: str | None = None
     task_queue: str = "langgraph"
     use_native_interrupt: bool = False
-    use_core_instrumentation: bool = False
-    """Experimental, OPT-IN: route governance through the shared ``openbox_core``
-    hook runtime (``LangGraphFrameworkAdapter`` + base instrumentation) instead
-    of relying solely on the legacy in-repo OTel hooks. Default ``False`` keeps
-    the legacy-only path byte-for-byte unchanged. Has no effect when `client`
-    is injected — no core runtime is built in that case, so there is nothing
-    for base instrumentation to arm."""
+    use_core_instrumentation: bool = True
+    """Route hook governance through the shared ``openbox_core`` base
+    instrumentation (``LangGraphFrameworkAdapter`` + InstrumentationManager) —
+    the only hook runtime. Default ``True``. Setting it ``False`` fails fast
+    (``OpenBoxConfigError``): legacy in-repo OTel hooks have been removed, so
+    there is no fallback. Has no effect when `client` is injected — that path
+    is lifecycle-only and builds no core runtime, so no hooks are armed."""
     root_node_names: set[str] = field(default_factory=set)
     resolve_subagent_name: Callable[[LangGraphStreamEvent], str | None] | None = None
     """Optional hook for framework-specific subagent name detection.
@@ -427,28 +427,21 @@ class OpenBoxLangGraphHandler:
             "tool_type_map": opts.tool_type_map or {},
         })
 
-        # Span processor built FIRST (before the core runtime) so its
-        # instance can be threaded into `create_core_runtime` below as
-        # `legacy_span_processor` — the opt-in adapter's post-approval reset
-        # needs it to clear the LEGACY abort mark too, not just the base
-        # ContextStore's. Built unconditionally whenever global config is
-        # populated, matching the pre-reorder behavior exactly: even an
-        # injected-client handler (`opts.client` truthy, `_core_runtime is
-        # None`) gets a real `_span_processor` here — this was already true
-        # before this reordering, only the WITHIN-`__init__` sequencing moved.
-        gc = get_global_config()
-        if gc and gc.api_url and gc.api_key:
-            from openbox_langgraph.span_processor import WorkflowSpanProcessor
-            self._span_processor = WorkflowSpanProcessor()
-        else:
-            self._span_processor = None
+        # Legacy in-repo hook governance (and its WorkflowSpanProcessor body
+        # buffer) has been removed — base openbox_core instrumentation is the
+        # only hook runtime. The attribute is retained (always None) so any
+        # external subclass touching it degrades gracefully rather than
+        # AttributeError-ing.
+        self._span_processor = None
 
         if opts.client:
             # Injected client (e.g. a test double, or a subclass overriding
-            # evaluate_event) is used exactly as given — no core runtime/gate
-            # is built or wired here. This is the F2 seam: an injected client's
-            # OWN evaluate_event override still intercepts every governance
-            # call the handler makes, unaffected by the gate-routing below.
+            # evaluate_event) is used exactly as given — LIFECYCLE-ONLY: no
+            # core runtime is built and NO hook instrumentation is armed. This
+            # is the F2 seam: an injected client's OWN evaluate_event override
+            # still intercepts every lifecycle governance call the handler
+            # makes; hook-level (HTTP/DB/file/function) governance is simply
+            # not active on this path.
             self._client = opts.client
             self._core_runtime = None
         else:
@@ -456,13 +449,11 @@ class OpenBoxLangGraphHandler:
             # Own core runtime, own private ContextStore (create_core_runtime's
             # isolation guarantee) — built from the SAME resolved
             # api_url/api_key/timeout/on_api_error/agent_did/agent_private_key
-            # the legacy GovernanceClient below is constructed from, so the
-            # gate evaluates against the identical Core endpoint/identity.
-            # Built eagerly (not lazily on first evaluate_event call) because
-            # `create_core_runtime` performs no network I/O — only config
-            # resolution/validation and identity loading, both cheap and both
-            # already required (get_global_config() was itself populated by an
-            # earlier `initialize()` call that already validated these values).
+            # the GovernanceClient below is constructed from, so the gate
+            # evaluates against the identical Core endpoint/identity. Base
+            # instrumentation (the only hook runtime) is installed inside
+            # create_core_runtime; it raises OpenBoxConfigError when
+            # use_core_instrumentation=False (no legacy fallback exists).
             self._core_runtime = create_core_runtime(
                 self._config,
                 api_url=gc.api_url,
@@ -470,7 +461,6 @@ class OpenBoxLangGraphHandler:
                 governance_timeout=gc.governance_timeout,
                 agent_did=gc.agent_did,
                 agent_private_key=gc.agent_private_key,
-                legacy_span_processor=self._span_processor,
                 extra_ignored_urls={gc.api_url} if gc.api_url else None,
             )
             self._client = GovernanceClient(
@@ -482,52 +472,6 @@ class OpenBoxLangGraphHandler:
                 agent_private_key=gc.agent_private_key,
                 gate=self._core_runtime.gate,
             )
-
-        # Setup OTel HTTP governance hooks (required)
-        gc = get_global_config()
-        if gc and gc.api_url and gc.api_key:
-            from openbox_langgraph.otel_setup import (
-                FAMILY_ASYNCPG,
-                FAMILY_DBAPI,
-                FAMILY_FILE,
-                FAMILY_HTTP,
-                FAMILY_SQLALCHEMY,
-                setup_opentelemetry_for_governance,
-            )
-            # Hybrid exclusivity: when the opt-in core runtime is
-            # armed, base already installed its OWN wrappers for every family
-            # it covers (http, dbapi, asyncpg, sqlalchemy, file) via
-            # `create_core_runtime` above — this call must skip those SAME
-            # families so neither a silent double-evaluation nor a
-            # last-writer-wins governance gap occurs (see otel_setup.py's
-            # module docstring for the exact collision per family). Families
-            # base has no coverage for (urllib3, urllib, pymongo, redis) are
-            # never skipped — legacy remains their only governance.
-            #
-            # Gated on `self._core_runtime is not None`, NOT merely the flag:
-            # an injected `opts.client` makes `_core_runtime` unconditionally
-            # `None` regardless of `use_core_instrumentation` — no base
-            # instrumentation was ever installed to replace legacy's in that
-            # case, so skipping legacy here would be a pure GAP with nothing
-            # to fill it.
-            skip_families = (
-                {FAMILY_HTTP, FAMILY_DBAPI, FAMILY_ASYNCPG, FAMILY_SQLALCHEMY, FAMILY_FILE}
-                if self._config.use_core_instrumentation and self._core_runtime is not None
-                else None
-            )
-            setup_opentelemetry_for_governance(
-                span_processor=self._span_processor,
-                api_url=gc.api_url,
-                api_key=gc.api_key,
-                ignored_urls=[gc.api_url],
-                api_timeout=gc.governance_timeout,
-                on_api_error=self._config.on_api_error,
-                sqlalchemy_engine=opts.sqlalchemy_engine,
-                agent_did=gc.agent_did,
-                agent_private_key=gc.agent_private_key,
-                skip_families=skip_families,
-            )
-            _logger.debug("[OpenBox] OTel HTTP governance hooks enabled")
 
     # ─────────────────────────────────────────────────────────────
     # Pre-screen: enforce guardrails before stream starts
@@ -1375,23 +1319,6 @@ class OpenBoxLangGraphHandler:
             if name in self._config.skip_tool_types:
                 return None, False, True, "ToolStarted"
 
-            # Register activity context with SpanProcessor for hook-level governance
-            # All tools (including subagents) get span-level governance
-            if getattr(self, '_span_processor', None) is not None:
-                activity_context = {
-                    "source": "workflow-telemetry",
-                    "event_type": "ActivityStarted",
-                    "workflow_id": workflow_id,
-                    "run_id": run_id,
-                    "workflow_type": self._config.agent_name or "LangGraphRun",
-                    "task_queue": self._config.task_queue or "langgraph",
-                    "activity_id": event_run_id,
-                    "activity_type": name,
-                }
-                self._span_processor.set_activity_context(
-                    workflow_id, event_run_id, activity_context
-                )
-
             buffer.register(event_run_id, "tool", name, thread_id, langgraph_node, langgraph_step)
             buf = buffer.get(event_run_id)
             if buf is not None:
@@ -1401,8 +1328,11 @@ class OpenBoxLangGraphHandler:
 
             # Create OTel span to propagate trace context across asyncio.Task boundaries.
             # Tool execution happens in a spawned Task with a new OTel context — this span
-            # bridges the gap so httpx child spans inherit the correct trace_id.
-            if getattr(self, '_span_processor', None) is not None:
+            # bridges the gap so base-instrumentation child spans (httpx/db/file) inherit
+            # the correct trace_id, which the base runtime resolves back to this activity
+            # via its private TraceContextRegistry (the dual-write below). Only armed when
+            # this handler owns a core runtime (never the injected-client lifecycle path).
+            if should_dual_write(self._core_runtime):
                 parent_ctx = otel_context.get_current()
                 tool_span = _otel_tracer.start_span(
                     f"tool.{name}", context=parent_ctx, kind=otel_trace.SpanKind.INTERNAL,
@@ -1410,31 +1340,27 @@ class OpenBoxLangGraphHandler:
                 token = otel_context.attach(otel_trace.set_span_in_context(tool_span))
                 trace_id = tool_span.get_span_context().trace_id
                 if trace_id:
-                    self._span_processor.register_trace(trace_id, workflow_id, event_run_id)
-                    # Dual-write (ADDITIVE, opt-in): mirror the SAME trace-id
-                    # registration into the base runtime's private trace
-                    # registry — trace-only, never a ContextVar bind (see
-                    # module docstring). No-op when this handler has no core
-                    # runtime (injected-client handlers, `_core_runtime is None`).
-                    if should_dual_write(self._core_runtime):
-                        register_activity(
-                            self._core_runtime,
-                            trace_id,
-                            build_activity_context(
-                                config=self._config,
-                                workflow_id=workflow_id,
-                                run_id=run_id,
-                                activity_id=event_run_id,
-                                activity_type=name,
-                                activity_input=safe_serialize(data.get("input")),
-                                langgraph_node=langgraph_node,
-                                langgraph_step=langgraph_step,
-                                tool_type=tool_type,
-                                tool_name=name,
-                                subagent_name=subagent_name,
-                                parent_ids=event.parent_ids,
-                            ),
-                        )
+                    # Trace-only registration into the base runtime's private
+                    # trace registry — never a ContextVar bind (see
+                    # activity_context_binding module docstring).
+                    register_activity(
+                        self._core_runtime,
+                        trace_id,
+                        build_activity_context(
+                            config=self._config,
+                            workflow_id=workflow_id,
+                            run_id=run_id,
+                            activity_id=event_run_id,
+                            activity_type=name,
+                            activity_input=safe_serialize(data.get("input")),
+                            langgraph_node=langgraph_node,
+                            langgraph_step=langgraph_step,
+                            tool_type=tool_type,
+                            tool_name=name,
+                            subagent_name=subagent_name,
+                            parent_ids=event.parent_ids,
+                        ),
+                    )
                 if buf is not None:
                     buf.otel_span = tool_span
                     buf.otel_token = token
@@ -1481,12 +1407,10 @@ class OpenBoxLangGraphHandler:
                 if buf.otel_token is not None:
                     otel_context.detach(buf.otel_token)
                 buf.otel_span.end()
-                # Dual-write (ADDITIVE, opt-in): update the same trace-id
-                # binding to the COMPLETED activity identity for the brief
-                # window a completion hook could still resolve it (mirrors the
-                # legacy clear_activity_context timing), then unregister —
-                # the trace's underlying OTel span is now ended, so nothing
-                # else will ever look it up again.
+                # Update the same trace-id binding to the COMPLETED activity
+                # identity for the brief window a completion hook could still
+                # resolve it, then unregister — the trace's underlying OTel
+                # span is now ended, so nothing else will ever look it up again.
                 if trace_id and should_dual_write(self._core_runtime):
                     register_activity(
                         self._core_runtime,
@@ -1507,10 +1431,6 @@ class OpenBoxLangGraphHandler:
                         ),
                     )
                     unregister_activity(self._core_runtime, trace_id)
-
-            # Clear SpanProcessor activity context for all tools
-            if getattr(self, '_span_processor', None) is not None:
-                self._span_processor.clear_activity_context(workflow_id, event_run_id)
 
             buffer.remove(event_run_id)
             tool_output = data.get("output")
@@ -1543,23 +1463,12 @@ class OpenBoxLangGraphHandler:
 
         if ev == "on_chat_model_start":
             buffer.register(event_run_id, "llm", name, thread_id, langgraph_node, langgraph_step)
-            # Register activity context with OTel SpanProcessor for hook-level governance
-            if getattr(self, '_span_processor', None) is not None:
-                activity_context = {
-                    "source": "workflow-telemetry",
-                    "event_type": "ActivityStarted",
-                    "workflow_id": workflow_id,
-                    "run_id": run_id,
-                    "workflow_type": self._config.agent_name or "LangGraphRun",
-                    "task_queue": self._config.task_queue or "langgraph",
-                    "activity_id": event_run_id,
-                    "activity_type": "llm_call",
-                }
-                self._span_processor.set_activity_context(
-                    workflow_id, event_run_id, activity_context
-                )
-
-                # Create OTel span to propagate trace context across asyncio.Task boundaries
+            # Create OTel span to propagate trace context across asyncio.Task
+            # boundaries so base-instrumentation child spans inherit this
+            # trace_id, resolved back to the llm_call activity via the base
+            # runtime's private trace registry. Only armed when this handler
+            # owns a core runtime (never the injected-client lifecycle path).
+            if should_dual_write(self._core_runtime):
                 parent_ctx = otel_context.get_current()
                 llm_span = _otel_tracer.start_span(
                     "llm.call", context=parent_ctx, kind=otel_trace.SpanKind.INTERNAL,
@@ -1567,27 +1476,24 @@ class OpenBoxLangGraphHandler:
                 token = otel_context.attach(otel_trace.set_span_in_context(llm_span))
                 trace_id = llm_span.get_span_context().trace_id
                 if trace_id:
-                    self._span_processor.register_trace(trace_id, workflow_id, event_run_id)
-                    # Dual-write (ADDITIVE, opt-in) — registered regardless of
-                    # whether LLMStarted ends up sent below (empty-prompt
-                    # subagent-internal LLM calls still get span-hook
-                    # governance during the call, mirroring the legacy path).
-                    if should_dual_write(self._core_runtime):
-                        register_activity(
-                            self._core_runtime,
-                            trace_id,
-                            build_activity_context(
-                                config=self._config,
-                                workflow_id=workflow_id,
-                                run_id=run_id,
-                                activity_id=event_run_id,
-                                activity_type="llm_call",
-                                langgraph_node=langgraph_node,
-                                langgraph_step=langgraph_step,
-                                subagent_name=subagent_name,
-                                parent_ids=event.parent_ids,
-                            ),
-                        )
+                    # Registered regardless of whether LLMStarted ends up sent
+                    # below (empty-prompt subagent-internal LLM calls still get
+                    # span-hook governance during the call).
+                    register_activity(
+                        self._core_runtime,
+                        trace_id,
+                        build_activity_context(
+                            config=self._config,
+                            workflow_id=workflow_id,
+                            run_id=run_id,
+                            activity_id=event_run_id,
+                            activity_type="llm_call",
+                            langgraph_node=langgraph_node,
+                            langgraph_step=langgraph_step,
+                            subagent_name=subagent_name,
+                            parent_ids=event.parent_ids,
+                        ),
+                    )
                 buf = buffer.get(event_run_id)
                 if buf is not None:
                     buf.otel_span = llm_span
@@ -1637,20 +1543,13 @@ class OpenBoxLangGraphHandler:
                 if buf.otel_token is not None:
                     otel_context.detach(buf.otel_token)
                 buf.otel_span.end()
-                # Dual-write (ADDITIVE, opt-in) cleanup: the LLM's OWN OTel
-                # span/trace_id (distinct from the parent tool's, if any) is
-                # ending now — unregister it from the base registry so it
-                # never resolves after this point. This is UNRELATED to the
-                # legacy `_activity_context` dict note below, which is keyed
-                # by workflow_id:activity_id (shared with the parent tool),
-                # not by this trace_id.
+                # Cleanup: the LLM's OWN OTel span/trace_id (distinct from the
+                # parent tool's, if any) is ending now — unregister it from the
+                # base registry so it never resolves after this point.
                 if llm_trace_id and should_dual_write(self._core_runtime):
                     unregister_activity(self._core_runtime, llm_trace_id)
 
             buffer.remove(event_run_id)
-            # Don't clear SpanProcessor activity context here — the tool (parent)
-            # is still active. Clearing would break subagent LLM span attribution.
-            # Context is cleared at on_tool_end instead.
             # Skip if LLMStarted was never sent (empty/no human-turn prompt).
             # Firing a hook_trigger span for a non-existent row creates an
             # orphan empty ActivityStarted row in Core.

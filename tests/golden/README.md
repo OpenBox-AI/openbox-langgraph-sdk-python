@@ -1,8 +1,8 @@
 # Golden wire-payload baseline
 
 Baseline oracle for the `openbox_langgraph` SDK's governance wire protocol —
-what `GovernanceClient.evaluate_event`, `hook_governance.evaluate_sync`, and
-`OpenBoxLangGraphHandler.ainvoke` put on the wire and in what order, captured
+what `GovernanceClient.evaluate_event` and `OpenBoxLangGraphHandler.ainvoke`
+put on the wire and in what order, captured
 against a mock HTTP transport (no real network, no simulated governance
 logic). A future refactor of the base SDK wiring will regenerate this same
 capture and byte-diff it against the fixtures committed here — that diff is
@@ -60,15 +60,17 @@ since the signature value is normalized away as volatile.
 | `fake_agent_graphs.py` | Minimal compiled LangGraph `StateGraph`s driven by `FakeMessagesListChatModel` (no network LLM call). |
 | `graph_capture_harness.py` | Layer 3: `OrderedCapture` (records both event ordering AND full wire bodies), `RecordingGovernanceClient` (injection seam, supports verdict overrides), `run_captured_ainvoke`/`run_ordered_capture`. |
 | `real_emitted_event_fixtures.py` | Drives real `handler.ainvoke()` runs (baseline / tool / subagent / error scenarios) and extracts the real wire body for each lifecycle event type. |
-| `hook_trigger_fixture.py` | Hook-level capture via `hook_governance.evaluate_sync` directly (separate module — different singleton-config surface than `GovernanceClient`). |
 | `layer1_handbuilt_pins.py` | The two verified-infeasible event types (see below) — hand-built, clearly labelled. |
 | `generate_fixtures.py` | Orchestrates all of the above. Run: `uv run --extra dev python3 -m tests.golden.generate_fixtures`. |
 
 Consumed by `tests/test_golden_baseline.py` (existence/non-emptiness,
-structural-key checks on real-emitted bodies, hook body has spans, signed vs.
-unsigned header sets, two-LLM-call de-dup guard) and
-`tests/test_hook_approval_retry_baseline.py` (separate concern — pins the
-known-broken hook-approval retry, not part of the wire-payload oracle).
+structural-key checks on real-emitted bodies, signed vs. unsigned header sets,
+two-LLM-call de-dup guard).
+
+> Note: legacy in-repo hook governance was removed — hook payloads/spans are
+> now owned by the base `openbox_core` instrumentation. The old
+> `hook_trigger.*` fixtures + `hook_trigger_fixture.py` capture were retired
+> with it; this oracle now covers lifecycle wire bodies only.
 
 ## Real-emitted vs. hand-built
 
@@ -105,7 +107,6 @@ should be replaced by a real-emitted capture and this note updated.
 Reuses the proven `httpx.MockTransport` seam from `test_did_client_signing.py`:
 
 - **Lifecycle bodies:** `client._client = httpx.AsyncClient(transport=MockTransport(rec))`.
-- **Hook bodies:** `hook_governance._sync_client = httpx.Client(transport=MockTransport(rec))`.
 - **Full-graph capture (real handler.ainvoke):** a real compiled `StateGraph` +
   fake chat model, wrapped by `OpenBoxLangGraphHandler` with an injected
   `RecordingGovernanceClient` (`client=` option) — no mock transport needed

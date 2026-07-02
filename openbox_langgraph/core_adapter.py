@@ -23,16 +23,13 @@ own inline ``ApprovalPoller`` (adapter-native flow always wins when present).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NoReturn
+from typing import NoReturn
 
 from openbox_core.context import ContextStore
 from openbox_core.contracts.context import ActivityContext
 from openbox_core.contracts.results import EvaluationResult, Verdict
 
 from openbox_langgraph.errors import GovernanceBlockedError, GovernanceHaltError
-
-if TYPE_CHECKING:
-    from openbox_langgraph.span_processor import WorkflowSpanProcessor
 
 __all__ = ["LangGraphFrameworkAdapter"]
 
@@ -41,13 +38,7 @@ class LangGraphFrameworkAdapter:
     """Maps base-SDK governance outcomes onto LangGraph-native errors.
 
     Args:
-        legacy_span_processor: When provided, ``reset_after_approval`` also
-            clears the legacy ``WorkflowSpanProcessor``'s abort flags for the
-            resolved turn — the two governance stores (legacy span processor,
-            base ``ContextStore``) are kept in sync so an approved retry runs
-            GOVERNED on whichever path a given operation used, not just the
-            one this adapter's own hook fired through.
-        context_store: The runtime's private ``ContextStore`` (dual-write
+        context_store: The runtime's private ``ContextStore`` (registration
             target). Falls back to ``ContextStore.current_activity_context()``
             when no explicit context is passed (started-hook / lifecycle
             paths never receive one — see ``handle_approval_sync``'s docstring
@@ -58,11 +49,9 @@ class LangGraphFrameworkAdapter:
 
     def __init__(
         self,
-        legacy_span_processor: WorkflowSpanProcessor | None = None,
         *,
         context_store: ContextStore | None = None,
     ) -> None:
-        self._legacy_span_processor = legacy_span_processor
         self._store = context_store if context_store is not None else ContextStore()
 
     # ── Lifecycle verdicts (WorkflowStarted/LLMStarted pre-screen, etc.) ───
@@ -90,10 +79,9 @@ class LangGraphFrameworkAdapter:
 
         Self-marks the abort flag (idempotent — ``mark_activity_aborted`` adds
         to a set) rather than relying solely on the caller
-        (``HookRuntime._mark_stopped`` already marks it upstream): the legacy
-        ``hook_governance._handle_verdict`` self-marks the SAME way, and this
-        adapter must hold under direct unit-test construction too, not only
-        when driven through the full ``HookRuntime`` call chain.
+        (``HookRuntime._mark_stopped`` already marks it upstream), so this
+        adapter holds under direct unit-test construction too, not only when
+        driven through the full ``HookRuntime`` call chain.
         """
         ctx = self._store.current_activity_context()
         if ctx is not None:
@@ -109,9 +97,8 @@ class LangGraphFrameworkAdapter:
 
         The base ``HookRuntime._adecide_started`` treats a normal RETURN as
         "approved, proceed" — raising here is the correct "not approved yet"
-        signal, mirroring exactly what the legacy async hook path
-        (``hook_governance.evaluate_async`` -> ``_handle_verdict``) already
-        does for ``requires_approval()`` verdicts.
+        signal for a ``requires_approval()`` verdict, so the handler's outer
+        catch/poll/retry loop drives the approval flow.
         """
         self._raise_pending_approval(result, self._store.current_activity_context())
 
@@ -157,41 +144,32 @@ class LangGraphFrameworkAdapter:
         adapter's ``on_completed_hook_result``, which is also a no-op)."""
         return None
 
-    # ── Post-approval reset (clears BOTH stores before the retry) ──────────
+    # ── Post-approval reset (clears the base store before the retry) ───────
 
     def reset_after_approval(self, workflow_id: str | None) -> None:
-        """Clear every abort mark registered under ``workflow_id`` on BOTH
-        governance stores, so the caller's retry (already GRANTED by
+        """Clear every abort mark registered under ``workflow_id`` on the base
+        store, so the caller's retry (already GRANTED by
         ``poll_until_decision``) runs GOVERNED instead of short-circuiting on
         a stale abort flag from the blocked first pass.
 
         Scoped to ``workflow_id`` (the per-TURN id), not a single
         ``activity_id``: an approved retry re-invokes the underlying graph
-        directly (bypassing this SDK's own dual-write registration), so the
-        exact ``activity_id`` its operations will use is not knowable up
-        front — but every activity a hook could have aborted THIS turn shares
-        the SAME ``workflow_id``. See
-        ``TraceContextRegistry.clear_aborted_for_workflow`` and
-        ``WorkflowSpanProcessor.clear_workflow_abort`` for why each store
-        needed a new, narrower-than-``sweep``/``unregister_workflow`` method
-        for this (both existing methods also drop trace/buffer state the
-        retry still needs).
+        directly (bypassing this SDK's own registration), so the exact
+        ``activity_id`` its operations will use is not knowable up front — but
+        every activity a hook could have aborted THIS turn shares the SAME
+        ``workflow_id``. See ``TraceContextRegistry.clear_aborted_for_workflow``
+        for why the store needed a new, narrower-than-``sweep`` method for this
+        (``sweep`` also drops trace state the retry still needs).
 
         Call this AFTER ``poll_until_decision`` resolves and BEFORE
         re-invoking the graph — never before the poll (that would let a
         second concurrent hook evaluation ignore the still-pending approval).
 
-        Clears:
-        1. The base store — via the owning ``FallbackContextStore.registry``
-           when present (duck-typed: checked by attribute, not import, to
-           avoid a circular import with that module), else a direct
-           ``clear_activity_aborted`` using the ambient bound context as a
-           best-effort single-activity fallback.
-        2. The legacy ``WorkflowSpanProcessor.clear_workflow_abort`` — if
-           ``legacy_span_processor`` was given, keeping the two governance
-           stores in sync regardless of which one a given operation's hook
-           actually marked (HTTP/DB/file/function may route through either
-           depending on the family-exclusivity switchboard).
+        Clears the base store — via the owning ``FallbackContextStore.registry``
+        when present (duck-typed: checked by attribute, not import, to avoid a
+        circular import with that module), else a direct
+        ``clear_activity_aborted`` using the ambient bound context as a
+        best-effort single-activity fallback.
 
         No-op when ``workflow_id`` is falsy (nothing is ever keyed on it).
         """
@@ -204,8 +182,6 @@ class LangGraphFrameworkAdapter:
             ctx = self._store.current_activity_context()
             if ctx is not None and ctx.workflow_id == workflow_id:
                 self._store.clear_activity_aborted(ctx.workflow_id, ctx.activity_id)
-        if self._legacy_span_processor is not None:
-            self._legacy_span_processor.clear_workflow_abort(workflow_id)
 
 
 def _resolve_identifier(result: EvaluationResult, ctx: ActivityContext | None) -> str:

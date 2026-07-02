@@ -48,7 +48,6 @@ from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     OpenBoxLangGraphHandlerOptions,
 )
-from openbox_langgraph.span_processor import WorkflowSpanProcessor
 from openbox_langgraph.types import GovernanceVerdictResponse, Verdict
 
 
@@ -138,27 +137,17 @@ def _build_tool_call_graph(url: str) -> Any:
 
 
 def _build_handler(graph: Any, runtime: Any) -> OpenBoxLangGraphHandler:
-    """Injected client keeps `__init__` from installing GLOBAL legacy OTel
-    hooks (network + process-wide side effects) — `_core_runtime` is then
-    pointed at the EXACT runtime `installed_conformance_runtime` armed, same
-    technique `test_hook_approval_retry_baseline.py` uses for its own
-    standalone `WorkflowSpanProcessor`.
-
-    `_span_processor` MUST be set too, even though this test never asserts
-    on it directly: `_process_event`'s tool-span creation (and the base
-    dual-write registration nested inside it) is gated on
-    `self._span_processor is not None` — production always builds both
-    together from the SAME global-config check, so a handler with a real
-    `_core_runtime` but a `None` `_span_processor` (an invalid combination
-    that never occurs outside tests) silently skips ALL trace registration,
-    including the base one, and every hook resolves "no bound context" —
-    found empirically debugging this exact test.
+    """Injected client keeps `__init__` from building its own core runtime —
+    `_core_runtime` is then pointed at the EXACT runtime
+    `installed_conformance_runtime` armed. `_process_event`'s tool-span
+    creation + base trace registration is gated on
+    `should_dual_write(self._core_runtime)`, so pointing `_core_runtime` at a
+    real runtime is all that's needed for hooks to resolve a bound context.
     """
     handler = OpenBoxLangGraphHandler(
         graph=graph, options=OpenBoxLangGraphHandlerOptions(client=_AllowEverythingClient())
     )
     handler._core_runtime = runtime  # type: ignore[attr-defined]
-    handler._span_processor = WorkflowSpanProcessor()  # type: ignore[attr-defined]
     return handler
 
 
