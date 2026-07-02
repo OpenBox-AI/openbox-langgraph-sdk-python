@@ -1,0 +1,38 @@
+[
+  {
+    "activity_id": "<ID>-sig",
+    "event_type": "SignalReceived"
+  },
+  {
+    "activity_id": "<ID>-wf",
+    "event_type": "WorkflowStarted"
+  },
+  {
+    "activity_id": "<ID>-pre",
+    "event_type": "LLMStarted"
+  },
+  {
+    "activity_id": "<ID>-pre-c",
+    "event_type": "LLMCompleted"
+  },
+  {
+    "activity_id": "<ID>",
+    "event_type": "ToolStarted"
+  },
+  {
+    "activity_id": "<ID>-c",
+    "event_type": "ToolCompleted"
+  },
+  {
+    "activity_id": "<ID>",
+    "event_type": "LLMStarted"
+  },
+  {
+    "activity_id": "<ID>-c",
+    "event_type": "LLMCompleted"
+  },
+  {
+    "activity_id": "<ID>",
+    "event_type": "ChainCompleted"
+  }
+]

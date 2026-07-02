@@ -1,0 +1,30 @@
+{
+  "activity_id": "019f224c-efec-7212-aea8-e3bd31e420bb-c",
+  "activity_output": {
+    "additional_kwargs": {},
+    "artifact": null,
+    "content": "echo: hi",
+    "id": null,
+    "name": "echo_tool",
+    "response_metadata": {},
+    "status": "success",
+    "tool_call_id": "call-1",
+    "type": "tool"
+  },
+  "activity_type": "echo_tool",
+  "duration_ms": 0.3136249966919422,
+  "event_type": "ActivityCompleted",
+  "hook_trigger": false,
+  "langgraph_node": "tools",
+  "langgraph_step": 2,
+  "run_id": "golden-subagent-body-run-run-e6384ea1",
+  "source": "workflow-telemetry",
+  "status": "completed",
+  "subagent_name": "writer",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.341Z",
+  "tool_name": "echo_tool",
+  "tool_type": "a2a",
+  "workflow_id": "golden-subagent-body-run-4e0334e0",
+  "workflow_type": "LangGraphRun"
+}

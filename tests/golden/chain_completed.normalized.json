@@ -1,0 +1,60 @@
+{
+  "activity_id": "<ID>",
+  "activity_output": {
+    "messages": [
+      {
+        "additional_kwargs": {},
+        "content": "hi",
+        "id": "<ID>",
+        "name": null,
+        "response_metadata": {},
+        "type": "human"
+      },
+      {
+        "additional_kwargs": {},
+        "content": "hello from fake model",
+        "id": "lc_run--<ID>-0",
+        "invalid_tool_calls": [],
+        "name": null,
+        "response_metadata": {},
+        "tool_calls": [],
+        "type": "ai",
+        "usage_metadata": null
+      }
+    ]
+  },
+  "activity_type": "LangGraph",
+  "duration_ms": "<DURATION_MS>",
+  "event_type": "WorkflowCompleted",
+  "hook_trigger": false,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "status": "completed",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_output": {
+    "messages": [
+      {
+        "additional_kwargs": {},
+        "content": "hi",
+        "id": "<ID>",
+        "name": null,
+        "response_metadata": {},
+        "type": "human"
+      },
+      {
+        "additional_kwargs": {},
+        "content": "hello from fake model",
+        "id": "lc_run--<ID>-0",
+        "invalid_tool_calls": [],
+        "name": null,
+        "response_metadata": {},
+        "tool_calls": [],
+        "type": "ai",
+        "usage_metadata": null
+      }
+    ]
+  },
+  "workflow_type": "LangGraph"
+}

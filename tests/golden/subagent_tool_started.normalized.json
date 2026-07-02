@@ -1,0 +1,31 @@
+{
+  "activity_id": "<ID>",
+  "activity_input": [
+    {
+      "text": "hi"
+    },
+    {
+      "__openbox": {
+        "subagent_name": "writer",
+        "tool_type": "a2a"
+      }
+    }
+  ],
+  "activity_type": "echo_tool",
+  "event_type": "ActivityStarted",
+  "hook_trigger": false,
+  "langgraph_node": "tools",
+  "langgraph_step": 2,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "subagent_name": "writer",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "tool_input": {
+    "text": "hi"
+  },
+  "tool_name": "echo_tool",
+  "tool_type": "a2a",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

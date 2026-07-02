@@ -1,0 +1,26 @@
+{
+  "activity_id": "<ID>-wf",
+  "activity_input": [
+    {
+      "messages": [
+        {
+          "additional_kwargs": {},
+          "content": "hi",
+          "id": null,
+          "name": null,
+          "response_metadata": {},
+          "type": "human"
+        }
+      ]
+    }
+  ],
+  "activity_type": "LangGraphRun",
+  "event_type": "WorkflowStarted",
+  "hook_trigger": false,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

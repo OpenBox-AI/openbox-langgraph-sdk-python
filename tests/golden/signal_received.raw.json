@@ -1,0 +1,16 @@
+{
+  "activity_id": "golden-baseline-body-run-run-81a84f28-sig",
+  "activity_type": "user_prompt",
+  "event_type": "SignalReceived",
+  "hook_trigger": false,
+  "run_id": "golden-baseline-body-run-run-81a84f28",
+  "signal_args": [
+    "hi"
+  ],
+  "signal_name": "user_prompt",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.327Z",
+  "workflow_id": "golden-baseline-body-run-b65d7162",
+  "workflow_type": "LangGraphRun"
+}

@@ -1,0 +1,18 @@
+{
+  "activity_id": "<ID>-pre",
+  "activity_input": [
+    {
+      "prompt": "hi"
+    }
+  ],
+  "activity_type": "llm_call",
+  "event_type": "ActivityStarted",
+  "hook_trigger": false,
+  "prompt": "hi",
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

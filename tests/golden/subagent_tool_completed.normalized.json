@@ -1,0 +1,30 @@
+{
+  "activity_id": "<ID>-c",
+  "activity_output": {
+    "additional_kwargs": {},
+    "artifact": null,
+    "content": "echo: hi",
+    "id": null,
+    "name": "echo_tool",
+    "response_metadata": {},
+    "status": "success",
+    "tool_call_id": "call-1",
+    "type": "tool"
+  },
+  "activity_type": "echo_tool",
+  "duration_ms": "<DURATION_MS>",
+  "event_type": "ActivityCompleted",
+  "hook_trigger": false,
+  "langgraph_node": "tools",
+  "langgraph_step": 2,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "status": "completed",
+  "subagent_name": "writer",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "tool_name": "echo_tool",
+  "tool_type": "a2a",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

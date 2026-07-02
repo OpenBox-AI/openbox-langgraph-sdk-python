@@ -1,0 +1,29 @@
+{
+  "activity_id": "<ID>-pre-c",
+  "activity_output": {
+    "additional_kwargs": {},
+    "content": "hello from fake model",
+    "id": "lc_run--<ID>-0",
+    "invalid_tool_calls": [],
+    "name": null,
+    "response_metadata": {},
+    "tool_calls": [],
+    "type": "ai",
+    "usage_metadata": null
+  },
+  "activity_type": "llm_call",
+  "duration_ms": "<DURATION_MS>",
+  "event_type": "ActivityCompleted",
+  "has_tool_calls": false,
+  "hook_trigger": false,
+  "langgraph_node": "agent",
+  "langgraph_step": 1,
+  "llm_model": "FakeMessagesListChatModel",
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "status": "completed",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

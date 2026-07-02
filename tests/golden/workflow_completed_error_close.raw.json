@@ -1,0 +1,14 @@
+{
+  "activity_id": "golden-error-close-body-run-run-0222428b-wf",
+  "activity_type": "LangGraphRun",
+  "error": "golden baseline error-close trigger",
+  "event_type": "WorkflowCompleted",
+  "hook_trigger": false,
+  "run_id": "golden-error-close-body-run-run-0222428b",
+  "source": "workflow-telemetry",
+  "status": "failed",
+  "task_queue": "langgraph",
+  "timestamp": "2026-07-02T10:08:15.343Z",
+  "workflow_id": "golden-error-close-body-run-cb827935",
+  "workflow_type": "LangGraphRun"
+}

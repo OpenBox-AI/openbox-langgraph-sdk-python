@@ -1,0 +1,16 @@
+{
+  "activity_id": "<ID>-sig",
+  "activity_type": "user_prompt",
+  "event_type": "SignalReceived",
+  "hook_trigger": false,
+  "run_id": "<ID>",
+  "signal_args": [
+    "hi"
+  ],
+  "signal_name": "user_prompt",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}

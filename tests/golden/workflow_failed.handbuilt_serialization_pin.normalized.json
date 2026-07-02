@@ -1,0 +1,16 @@
+{
+  "activity_id": "<ID>-wf",
+  "activity_type": "GoldenBaselineAgent",
+  "error": {
+    "message": "unrecoverable workflow error"
+  },
+  "event_type": "WorkflowFailed",
+  "hook_trigger": false,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "status": "failed",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "workflow_id": "<ID>",
+  "workflow_type": "GoldenBaselineAgent"
+}

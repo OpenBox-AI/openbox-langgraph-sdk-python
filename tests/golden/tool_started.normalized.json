@@ -1,0 +1,23 @@
+{
+  "activity_id": "<ID>",
+  "activity_input": [
+    {
+      "text": "hi"
+    }
+  ],
+  "activity_type": "echo_tool",
+  "event_type": "ActivityStarted",
+  "hook_trigger": false,
+  "langgraph_node": "tools",
+  "langgraph_step": 2,
+  "run_id": "<ID>",
+  "source": "workflow-telemetry",
+  "task_queue": "langgraph",
+  "timestamp": "<TS>",
+  "tool_input": {
+    "text": "hi"
+  },
+  "tool_name": "echo_tool",
+  "workflow_id": "<ID>",
+  "workflow_type": "LangGraphRun"
+}
