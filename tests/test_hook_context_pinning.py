@@ -102,3 +102,27 @@ async def test_acompleted_reuses_pinned_context_despite_store_drift() -> None:
         await hookrt.acompleted(span, hook_type=_HOOK)
 
     assert fake.completed_payloads[0]["activity_id"] == "act-A"
+
+
+def test_completed_block_marks_abort_on_pinned_activity_not_drifted() -> None:
+    """A completed BLOCK marks abort for FUTURE execution — it must mark the
+    PINNED activity (A), never the drifted store context (B). Guards that the
+    base `_after_completed`/`_mark_stopped` resolves the pinned context (bound
+    via activity_scope) rather than re-resolving the drifted trace map."""
+    fake = FakeCore({"verdict": "allow"}, {"verdict": "block", "reason": "post-hoc"})
+    store = FallbackContextStore()
+    adapter = LangGraphFrameworkAdapter(context_store=store)
+    with installed_conformance_runtime(fake, adapter, store) as rt:
+        hookrt = LangGraphHookRuntime(rt)
+        span = _real_span("http_call_block")
+        trace_id = span.get_span_context().trace_id
+
+        store.register_trace(trace_id, _ctx("act-A"))
+        hookrt.preflight(span, hook_type=_HOOK)  # ALLOW (queue[0])
+
+        store.register_trace(trace_id, _ctx("act-B"))  # DRIFT
+        span.end()
+        hookrt.completed(span, hook_type=_HOOK)  # BLOCK (queue[1]) → marks abort
+
+    assert store.is_activity_aborted("wf-pin", "act-A")  # pinned activity marked
+    assert not store.is_activity_aborted("wf-pin", "act-B")  # drifted NOT marked
