@@ -157,10 +157,12 @@ that check; it is not normalized and will differ between runs.
   path (`workflow_completed_error_close.*`, `status: "failed"`) — the two
   are genuinely different events, not duplicates.
 - A two-LLM-call turn produces two fully independent `LLMStarted`/
-  `LLMCompleted` pairs with distinct activity_ids — there is no keyed
-  `(activity_id, event_type)` de-dup store for this path; de-dup is
-  implicit (the guardrails callback owns `LLMStarted`, `_process_event`
-  unconditionally skips re-sending it).
+  `LLMCompleted` pairs with distinct activity_ids — so they do NOT collide
+  in the de-dup store (which keys on `(activity_id, event_type)`). That
+  store lives in `GovernanceClient` (`client.py` `_dedup_run`/`_dedup_sent`
+  + `_is_duplicate`), scoped per `(workflow_id, run_id)` and reset each run;
+  it is real, not absent. The handler additionally skips re-sending the
+  pre-screen `LLMStarted` from `_process_event` — a separate avoidance.
 - Subagent-labelled Tool events (`resolve_subagent_name` set) carry
   `subagent_name` and `tool_type: "a2a"` on the wire, plus an appended
   `{"__openbox": {...}}` entry in `activity_input` for Rego policy use.
