@@ -277,6 +277,124 @@ async def test_existing_toolnode_wrappers_still_run_inside_the_bound_scope() -> 
     assert seen["activity_id"] == result["starts"]["probe"], "OpenBox binding still applies"
 
 
+async def test_sync_only_user_wrapper_still_runs_on_async_path() -> None:
+    """LangGraph's ``_arun_one`` falls back to the SYNC wrapper when no async
+    wrapper exists. Binding must preserve that: a user sync-only
+    ``wrap_tool_call`` keeps running under ``astream_events``/``ainvoke``
+    (openbox leaves ``_awrap_tool_call`` unset and composes the user wrapper on
+    the sync seam), and the binding still applies with the exact lifecycle id."""
+    store = ContextStore()
+    order: list[str] = []
+    seen: dict[str, Any] = {}
+
+    @tool
+    def probe(query: str) -> str:
+        """Record the bound id from inside the sync tool."""
+        ctx = store.current_activity_context()
+        seen["activity_id"] = ctx.activity_id if ctx else None
+        return "ok"
+
+    def user_sync_wrap(request, execute):
+        order.append("enter")
+        result = execute(request)
+        order.append("exit")
+        return result
+
+    tool_node = ToolNode([probe], wrap_tool_call=user_sync_wrap)
+
+    def model(state: _AgentState) -> dict[str, Any]:
+        msgs = state["messages"]
+        if msgs and any(getattr(m, "type", None) == "tool" for m in msgs):
+            return {"messages": [AIMessage(content="done")]}
+        tool_calls = [{"name": "probe", "args": {"query": "x"}, "id": "c1"}]
+        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+
+    def route(state: _AgentState) -> str:
+        return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
+
+    graph = StateGraph(_AgentState)
+    graph.add_node("model", model)
+    graph.add_node("tools", tool_node)
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+    graph.add_edge("tools", "model")
+    compiled = graph.compile()
+    bind_tools_activity_scope(
+        compiled,
+        core_runtime=_RT(store),
+        config=GovernanceConfig(),
+        resolve_tool_type=lambda n: None,
+    )
+
+    # The async seam stays unset — LangGraph's own async→sync-wrapper fallback
+    # must keep routing through openbox_sync (which composes the user wrapper).
+    assert tool_node._awrap_tool_call is None
+
+    result = await _drive(compiled, workflow_id="wf-1", run_id="run-1")
+
+    assert order == ["enter", "exit"], "user sync wrapper must run on the async path"
+    assert seen["activity_id"] == result["starts"]["probe"]
+
+
+async def test_retry_wrapper_reexecutes_under_the_same_canonical_id() -> None:
+    """A user wrapper may call ``execute`` MORE THAN ONCE (retries — LangGraph
+    documents the multi-call contract). ``BaseTool`` consumes ``config["run_id"]``
+    with ``pop()`` per run, so binding re-installs the canonical id before every
+    delegate call: all attempts' ``on_tool_start`` events AND the bound scope
+    share ONE id — the second attempt never drifts to a fresh LangChain id."""
+    store = ContextStore()
+    bound_ids: list[str | None] = []
+
+    @tool
+    async def probe(query: str) -> str:
+        """Record the bound id per attempt."""
+        ctx = store.current_activity_context()
+        bound_ids.append(ctx.activity_id if ctx else None)
+        return "ok"
+
+    async def retry_awrap(request, execute):
+        await execute(request)  # first attempt, result discarded
+        return await execute(request)  # retry
+
+    tool_node = ToolNode([probe], awrap_tool_call=retry_awrap)
+
+    def model(state: _AgentState) -> dict[str, Any]:
+        msgs = state["messages"]
+        if msgs and any(getattr(m, "type", None) == "tool" for m in msgs):
+            return {"messages": [AIMessage(content="done")]}
+        tool_calls = [{"name": "probe", "args": {"query": "x"}, "id": "c1"}]
+        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+
+    def route(state: _AgentState) -> str:
+        return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
+
+    graph = StateGraph(_AgentState)
+    graph.add_node("model", model)
+    graph.add_node("tools", tool_node)
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+    graph.add_edge("tools", "model")
+    compiled = graph.compile()
+    bind_tools_activity_scope(
+        compiled,
+        core_runtime=_RT(store),
+        config=GovernanceConfig(),
+        resolve_tool_type=lambda n: None,
+    )
+
+    start_ids: list[str] = []
+    cfg = {"metadata": turn_metadata("wf-1", "run-1")}
+    async for ev in compiled.astream_events({"messages": []}, config=cfg, version="v2"):
+        if ev["event"] == "on_tool_start":
+            start_ids.append(str(ev["run_id"]))
+
+    assert len(bound_ids) == 2, "the tool must have run twice (attempt + retry)"
+    one_id = {*start_ids, *bound_ids}
+    assert len(one_id) == 1 and None not in one_id, (
+        f"every attempt and the bound scope must share one canonical id, got {one_id}"
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # 7: strict vs default no-context policy
 # ─────────────────────────────────────────────────────────────

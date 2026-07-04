@@ -57,10 +57,12 @@ class TraceContextRegistry:
     def __init__(self, store: ContextStore) -> None:
         self._store = store
         self._lock = threading.Lock()
-        # Trace keys registered this turn — the context VALUE lives in the base
-        # ``ContextStore`` (exact resolution reads it there); this set exists
-        # only so ``sweep`` knows which trace keys to unregister at turn-exit.
-        self._by_trace: set[int] = set()
+        # Trace key -> owning turn's workflow_id. The context VALUE lives in the
+        # base ``ContextStore`` (exact resolution reads it there); this map
+        # exists so ``sweep(workflow_id)`` unregisters ONLY that turn's trace
+        # keys at turn-exit — concurrent turns on one handler share this
+        # registry, and turn A's cleanup must not drop turn B's live bindings.
+        self._by_trace: dict[int, str | None] = {}
         # Every (workflow_id, activity_id) a `register()` call has EVER bound
         # in the current turn — kept independent of `_by_trace` (which loses
         # entries on `unregister`) so a completed activity's abort mark is
@@ -82,7 +84,7 @@ class TraceContextRegistry:
         key = canonical_trace_key(trace_id)
         self._store.register_trace(key, ctx)
         with self._lock:
-            self._by_trace.add(key)
+            self._by_trace[key] = ctx.workflow_id
             self._activity_keys.add((ctx.workflow_id, ctx.activity_id))
 
     def unregister(self, trace_id: int | str) -> None:
@@ -90,32 +92,41 @@ class TraceContextRegistry:
         key = canonical_trace_key(trace_id)
         self._store.unregister_trace(key)
         with self._lock:
-            self._by_trace.discard(key)
+            self._by_trace.pop(key, None)
 
     def sweep(self, workflow_id: str | None = None) -> None:
-        """Drop ALL bindings + turn-scoped bookkeeping (turn-exit cleanup).
+        """Drop ONE turn's bindings + turn-scoped bookkeeping (turn-exit cleanup).
 
-        Only clears the trace map and abort marks THIS registry tracked —
-        never ``store.clear()``, which would also drop the runtime's
-        ``halt_requested`` flag and any other turn's abort marks, both of
-        which belong to the runtime's full lifetime, not a single turn.
+        Scoped to ``workflow_id`` when given: only that turn's trace keys and
+        abort marks are cleared, because concurrent turns on one handler share
+        this registry — turn A's cleanup must not unregister turn B's live
+        exact-trace bindings (B's hook spans would silently lose resolution).
+        ``workflow_id=None`` clears everything this registry tracked (full
+        teardown), but never ``store.clear()``, which would also drop the
+        runtime's ``halt_requested`` flag — that belongs to the runtime's full
+        lifetime, not a single turn.
 
-        When ``workflow_id`` is given, also clears every abort mark this
-        registry ever registered an activity under for that turn (see
-        ``_activity_keys``) — the base ``ContextStore`` has no prefix-sweep
-        of its own (unlike the legacy ``WorkflowSpanProcessor.unregister_workflow``),
-        so this registry supplies the missing per-turn sweep instead.
+        Also clears every abort mark this registry ever registered an activity
+        under for the swept turn (see ``_activity_keys``) — the base
+        ``ContextStore`` has no prefix-sweep of its own (unlike the legacy
+        ``WorkflowSpanProcessor.unregister_workflow``), so this registry
+        supplies the missing per-turn sweep instead.
         """
         with self._lock:
-            keys = list(self._by_trace)
-            self._by_trace.clear()
+            if workflow_id is None:
+                keys = list(self._by_trace)
+                self._by_trace.clear()
+            else:
+                keys = [k for k, wf in self._by_trace.items() if wf == workflow_id]
+                for k in keys:
+                    del self._by_trace[k]
             activity_keys = (
-                [k for k in self._activity_keys if k[0] == workflow_id]
+                [ak for ak in self._activity_keys if ak[0] == workflow_id]
                 if workflow_id is not None
                 else list(self._activity_keys)
             )
-            for k in activity_keys:
-                self._activity_keys.discard(k)
+            for ak in activity_keys:
+                self._activity_keys.discard(ak)
         for key in keys:
             self._store.unregister_trace(key)
         for wf_id, activity_id in activity_keys:
