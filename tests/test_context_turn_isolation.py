@@ -87,6 +87,44 @@ def _simple_graph() -> Any:
     return graph.compile()
 
 
+def test_sweep_only_clears_its_own_workflows_trace_bindings() -> None:
+    """`_cleanup_turn` promises to sweep ONLY its own turn's bindings — with
+    concurrent turns on one handler, turn A finishing must not unregister turn
+    B's still-live exact trace binding (B's hook spans would silently lose
+    resolution). Direct registry-level check of that contract."""
+    from openbox_core.context import ContextStore
+    from openbox_core.contracts.context import ActivityContext
+
+    from openbox_langgraph.trace_context_registry import TraceContextRegistry
+
+    store = ContextStore()
+    registry = TraceContextRegistry(store)
+
+    def _ctx(workflow_id: str, activity_id: str) -> ActivityContext:
+        return ActivityContext(
+            workflow_id=workflow_id,
+            run_id="r",
+            workflow_type="W",
+            task_queue="q",
+            activity_id=activity_id,
+            activity_type="probe",
+        )
+
+    registry.register(111, _ctx("wf-A", "act-A"))
+    registry.register(222, _ctx("wf-B", "act-B"))
+
+    registry.sweep("wf-A")  # turn A's cleanup
+
+    assert store.context_for_trace(111) is None, "A's own binding is swept"
+    survivor = store.context_for_trace(222)
+    assert survivor is not None and survivor.activity_id == "act-B", (
+        "turn B's live exact binding must survive turn A's cleanup"
+    )
+
+    registry.sweep(None)  # full teardown clears the rest
+    assert store.context_for_trace(222) is None
+
+
 @pytest.mark.asyncio
 async def test_two_sequential_ainvoke_turns_use_distinct_workflow_ids() -> None:
     """Each `ainvoke` call mints a fresh, distinct `workflow_id` — the

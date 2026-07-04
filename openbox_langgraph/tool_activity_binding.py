@@ -156,33 +156,45 @@ def _turn_ids(request: Any) -> dict[str, str] | None:
     return turn if isinstance(turn, dict) else None
 
 
-def _prepare_context(
+def _prepare_binding(
     request: Any,
     config: GovernanceConfig,
     resolve_tool_type: Callable[[str], str | None],
-) -> ActivityContext | None:
-    """Mint the canonical activity id, WRITE it to ``config["run_id"]``, and build
-    the ``ActivityContext`` — or return ``None`` when this tool cannot be bound.
+) -> tuple[ActivityContext | None, Callable[[], None] | None]:
+    """Mint the canonical activity id and build the ``ActivityContext``, or
+    ``(None, None)`` when this tool cannot be bound.
 
-    ``None`` means "no governed turn": the caller executes the tool UNBOUND
-    (default) or, under ``strict_activity_context``, has already raised. The
-    canonical id is written to ``config["run_id"]`` so the ``on_tool_start``
-    event — thus ``ToolStarted.activity_id`` — matches this context's
-    ``activity_id`` exactly. Never mints an id it does not also write.
+    Returns ``(ctx, install_run_id)``: ``install_run_id`` WRITES the canonical
+    id into the tool call's ``config["run_id"]`` so the ``on_tool_start`` event
+    — thus ``ToolStarted.activity_id`` — matches ``ctx.activity_id`` exactly.
+    It is called once here and MUST be re-called before every delegate
+    ``execute(request)`` invocation: ``BaseTool`` CONSUMES the id with
+    ``config.pop("run_id")`` per run, and a user wrapper may call ``execute``
+    more than once (retries) — without the re-install, the second run would
+    mint a fresh LangChain id while the bound scope still carries the first.
+
+    ``(None, None)`` means "no governed turn": the caller executes the tool
+    UNBOUND (default) or, under ``strict_activity_context``, has already
+    raised. Never mints an id it does not also write.
     """
     tool_call = getattr(request, "tool_call", None) or {}
     name = tool_call.get("name") or "tool"
     turn = _turn_ids(request)
     if turn is None:
         _handle_missing_binding(config, name, tool_call.get("id"))
-        return None
+        return None, None
 
-    # runtime.config is a dict here (verified by _turn_ids returning non-None).
+    # runtime.config is a dict here (verified by _turn_ids returning non-None) —
+    # the SAME dict the ToolNode ``execute`` closure forwards to the tool run.
+    cfg = request.runtime.config
     canonical = uuid.uuid4()
-    request.runtime.config["run_id"] = canonical
 
+    def install_run_id() -> None:
+        cfg["run_id"] = canonical
+
+    install_run_id()
     args = tool_call.get("args")
-    return build_activity_context(
+    ctx = build_activity_context(
         config=config,
         workflow_id=turn.get("workflow_id", ""),
         run_id=turn.get("run_id", ""),
@@ -193,6 +205,7 @@ def _prepare_context(
         tool_name=name,
         tool_call_id=tool_call.get("id"),
     )
+    return ctx, install_run_id
 
 
 def _handle_missing_binding(
@@ -228,11 +241,19 @@ def _bind_tool_node(
     """Compose OpenBox binding onto a ToolNode's ``_wrap_tool_call`` /
     ``_awrap_tool_call`` seams, preserving any user-provided wrapper.
 
-    Both seams are always installed so native async tools keep their async
-    execute path (leaving ``_awrap_tool_call`` unset would route async execution
-    through the sync wrapper). A user wrapper on the matching seam runs INSIDE
-    the bound scope; a user sync-only wrapper is composed on the sync path (its
-    behavior on the async path is superseded by native async binding).
+    A user wrapper runs INSIDE the bound scope and receives a re-installing
+    ``execute`` (see ``_prepare_binding`` — the canonical id must be re-written
+    before every call because ``BaseTool`` pops it per run).
+
+    Seam installation mirrors LangGraph's own dispatch: ``_awrap_tool_call`` is
+    installed UNLESS the user provided a sync-only wrapper. LangGraph's
+    ``_arun_one`` falls back to calling the SYNC wrapper (with a sync execute
+    shim) when no async wrapper exists — installing ours unconditionally would
+    intercept that fallback and silently skip the user's sync wrapper on the
+    async path. Leaving the seam unset keeps async execution routing through
+    ``openbox_sync`` (which composes the user wrapper), exactly as stock
+    LangGraph does; the sync wrapper runs inline on the event-loop thread, so
+    the ContextVar bind still reaches the tool body.
     """
     if getattr(tool_node, _BIND_MARK, False):
         return
@@ -242,29 +263,40 @@ def _bind_tool_node(
     )
 
     def openbox_sync(request: Any, execute: Callable[[Any], Any]) -> Any:
-        def _inner() -> Any:
+        ctx, install_run_id = _prepare_binding(request, config, resolve_tool_type)
+        if ctx is None:
             if existing_sync is not None:
                 return existing_sync(request, execute)
             return execute(request)
+        assert install_run_id is not None  # paired with ctx by construction
 
-        ctx = _prepare_context(request, config, resolve_tool_type)
-        if ctx is None:
-            return _inner()
+        def reexecute(req: Any) -> Any:
+            install_run_id()  # BaseTool popped it — re-install for THIS run
+            return execute(req)
+
         with activity_scope(ctx, store=store):
-            return _inner()
+            if existing_sync is not None:
+                return existing_sync(request, reexecute)
+            return reexecute(request)
 
     async def openbox_async(request: Any, execute: Callable[[Any], Awaitable[Any]]) -> Any:
-        async def _inner() -> Any:
+        ctx, install_run_id = _prepare_binding(request, config, resolve_tool_type)
+        if ctx is None:
             if existing_async is not None:
                 return await existing_async(request, execute)
             return await execute(request)
+        assert install_run_id is not None  # paired with ctx by construction
 
-        ctx = _prepare_context(request, config, resolve_tool_type)
-        if ctx is None:
-            return await _inner()
+        async def reexecute(req: Any) -> Any:
+            install_run_id()  # BaseTool popped it — re-install for THIS run
+            return await execute(req)
+
         with activity_scope(ctx, store=store):
-            return await _inner()
+            if existing_async is not None:
+                return await existing_async(request, reexecute)
+            return await reexecute(request)
 
     tool_node._wrap_tool_call = openbox_sync
-    tool_node._awrap_tool_call = openbox_async
+    if existing_sync is None or existing_async is not None:
+        tool_node._awrap_tool_call = openbox_async
     tool_node._openbox_activity_bound = True

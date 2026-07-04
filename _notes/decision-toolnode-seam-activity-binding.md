@@ -53,6 +53,25 @@ which is exactly what lets us write it.
   `_awrap_tool_call` on the instance (read at call time), composing any
   user-provided wrapper INSIDE the bound scope.
 
+## Three sharp edges found in review (all fixed + regression-tested)
+
+- **`BaseTool` CONSUMES `config["run_id"]` with `pop()`** (langchain
+  `tools/base.py`). A user wrapper may call `execute(request)` more than once
+  (retries — documented multi-call contract), so the binder wraps the delegate
+  `execute` to RE-install the canonical id before EVERY call; otherwise attempt
+  2 mints a fresh LangChain id while the bound scope still carries attempt 1's.
+- **Sync-only `wrap_tool_call` + async execution**: LangGraph's `_arun_one`
+  falls back to calling the SYNC wrapper (with a sync execute shim) when no
+  async wrapper exists. Installing our `_awrap_tool_call` unconditionally
+  intercepts that fallback and silently skips the user's sync wrapper under
+  `ainvoke`. Fix: leave `_awrap_tool_call` unset when the user has a sync-only
+  wrapper — async execution then routes through `openbox_sync` (which composes
+  the user wrapper) exactly as stock LangGraph does.
+- **`TraceContextRegistry.sweep` must be workflow-scoped**: concurrent turns on
+  one handler share the registry; turn A's `_cleanup_turn` sweeping ALL trace
+  keys would drop turn B's live exact bindings. `_by_trace` maps trace key →
+  owning workflow_id and `sweep(workflow_id)` filters.
+
 ## Zero-fallback consequences
 
 - Runtime now uses a plain `openbox_core.context.ContextStore` (not the deleted
