@@ -4,16 +4,14 @@ Why this exists — the drift bug it fixes:
 
 The base :class:`~openbox_core.hooks.preflight.HookRuntime` resolves the bound
 ``ActivityContext`` INDEPENDENTLY at the started (preflight) and completed
-stages, via ``resolve_context`` → ``store.context_for_trace(trace_id)``. In
-Temporal that is stable because a `core_activity_scope` binds the context around
-the actual activity execution. LangGraph has no such scope: it reconstructs
-context from ``astream_events`` + a trace-lookup fallback ladder
-(:class:`~openbox_langgraph.trace_context_registry.TraceContextRegistry`:
-exact → single-active → last-registered). That ladder resolves to whatever
-activity is *currently* active — so a hook span that STARTED while ``load_skill``
-was active can COMPLETE after the run has moved on to ``llm_call``, and the
-completed stage is mis-attributed to ``llm_call``. Core then sees one source
-span split across two ``activity_id``s.
+stages, via ``resolve_context`` → ContextVar tier, then
+``store.context_for_trace(trace_id)``. When a hook resolves through the EXACT
+trace tier (an OTel span this SDK registered for a known activity — see
+:class:`~openbox_langgraph.trace_context_registry.TraceContextRegistry`), that
+trace binding can be RE-REGISTERED to a later activity between the started and
+completed stages as the run moves on. A hook span that STARTED while
+``load_skill`` was active could then COMPLETE resolving to ``llm_call``, and Core
+would see one source span split across two ``activity_id``s.
 
 Fix — and the boundary it respects: this runtime does NOT re-implement the hook
 path. It only supplies the RIGHT context. It pins the context resolved at

@@ -1,9 +1,9 @@
 """A HALT in one run must not affect a concurrent/later run in the same
 process.
 
-Each `create_core_runtime` call gets its OWN PRIVATE `ContextStore` (or
-`FallbackContextStore`) — this is the isolation mechanism, not a special
-suppression of `request_halt()`. `openbox_core.hooks.preflight.HookRuntime
+Each `create_core_runtime` call gets its OWN PRIVATE `ContextStore` — this is
+the isolation mechanism, not a special suppression of
+`request_halt()`. `openbox_core.hooks.preflight.HookRuntime
 ._mark_stopped` calls `self._store.request_halt()` on a HALT verdict
 UNCONDITIONALLY (base-SDK behavior, correct and expected) — but `self._store`
 is whichever runtime's OWN private store fired the hook, so a HALT in run A

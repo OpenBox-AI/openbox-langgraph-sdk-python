@@ -1,30 +1,24 @@
-"""Trace-lookup fallback shim: LangGraph-adapter bookkeeping over a private
-base-SDK ``ContextStore``, plus the fail-loud miss-observability surface.
+"""EXACT trace registration + per-turn abort bookkeeping over a private
+base-SDK ``ContextStore``.
 
 LangGraph spawns tool/LLM execution as ``asyncio.Task``s (and, for sync
-tools, ``run_in_executor`` worker threads). Both copy/lose the current
-``ContextVar`` at spawn time, so a context bound on the stream-consumer
-coroutine never reaches code running inside the spawned task — proven
-empirically in ``tests/test_contextvars_propagation.py``. The base SDK's own
-``openbox_core.hooks.events.resolve_context`` only tries the ContextVar, then
-one exact trace-id lookup; on a miss it skips the hook SILENTLY (correct for
-the base SDK's framework-agnostic default, but LangGraph's task-spawn pattern
-makes that miss the common case, not the exception).
+tools, ``run_in_executor`` worker threads). The ContextVar tier bound at the
+ToolNode seam (``tool_activity_binding``) reaches most of that spawned work,
+but not code the SDK does not own the execution context of (e.g. a raw thread
+a tool spawns). For those, this SDK registers the trace id of an OTel parent
+span it EXPLICITLY creates for a known activity, so
+``openbox_core.hooks.events.resolve_context``'s exact trace-id tier can resolve
+that activity — a known trace id mapped to a known ``ActivityContext``.
 
-``TraceContextRegistry.resolve`` mirrors the legacy
-``WorkflowSpanProcessor.get_activity_context_by_trace`` fallback ladder
-(exact-trace -> single-active -> last-registered) over the SAME private
-``ContextStore`` the dual-write in ``langgraph_handler.py`` populates —
-without reaching into ``ContextStore`` internals, since the base store
-deliberately does not expose enumeration/order of its trace map. The
-bookkeeping needed for tiers 2/3 lives here, on the LangGraph adapter side,
-exactly where the legacy processor keeps its own ``_activity_context``/
-``_last_activity_key`` bookkeeping today.
+This is EXACT registration ONLY. There is deliberately no single-active /
+last-registered guessing: a hook span resolves to the activity it can be proven
+to belong to (ContextVar tier, then exact trace tier), or it stays unbound.
+This registry therefore keeps only what exact registration and per-turn cleanup
+need — the trace-id -> context map (for ``sweep``) and the set of activity keys
+ever registered this turn (for abort-mark cleanup).
 
-A resolution miss is NEVER a silent skip: it is logged at WARNING (visible in
-default log configs, unlike the base SDK's DEBUG) and counted in
-``ContextMissMetrics`` so callers/tests can assert on it. An ungoverned
-operation under ``use_core_instrumentation=True`` must be observable.
+Thread-safe: LangGraph sync tools run inside ``run_in_executor`` worker
+threads that register concurrently with the async stream consumer.
 """
 
 from __future__ import annotations
@@ -32,8 +26,6 @@ from __future__ import annotations
 import logging
 import threading
 import weakref
-from collections import OrderedDict
-from dataclasses import dataclass
 
 from openbox_core.context import ContextStore, canonical_trace_key
 from openbox_core.contracts.context import ActivityContext
@@ -42,62 +34,45 @@ from openbox_core.runtime import OpenBoxRuntime
 _logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ContextMissMetrics",
     "TraceContextRegistry",
     "get_context_store",
     "get_trace_registry",
 ]
 
 
-@dataclass
-class ContextMissMetrics:
-    """Observable counters for trace-lookup misses — the fail-loud surface.
-
-    Incremented by :meth:`TraceContextRegistry.resolve` whenever every
-    fallback tier is exhausted with no registered context. Tests assert on
-    ``miss_count``; a real deployment would export it as a metric alongside
-    the WARNING log line.
-    """
-
-    miss_count: int = 0
-    last_miss_trace_id: int | None = None
-
-    def record_miss(self, trace_id: int) -> None:
-        self.miss_count += 1
-        self.last_miss_trace_id = trace_id
-
-
 class TraceContextRegistry:
-    """LangGraph-adapter trace bookkeeping layered on top of a private ``ContextStore``.
+    """LangGraph-adapter EXACT trace registration over a private ``ContextStore``.
 
     Every ``register`` call dual-writes: the base ``ContextStore.register_trace``
-    (so ``openbox_core.hooks.events.resolve_context``'s own exact trace-id tier
-    keeps working unchanged) AND a local ``OrderedDict`` this class owns, which
-    is what makes the single-active / last-registered fallback tiers possible
-    without reaching into ``ContextStore`` internals (it has no public API to
-    enumerate or order its trace map — by design, see ``context.py``).
+    (so ``openbox_core.hooks.events.resolve_context``'s exact trace-id tier
+    resolves it) AND a local ``OrderedDict`` this class owns, which ``sweep``
+    uses to drop exactly this turn's bindings at turn-exit (the base store has
+    no public per-turn enumeration of its trace map — by design, see
+    ``context.py``).
 
     Thread-safe: LangGraph sync tools run inside ``run_in_executor`` worker
-    threads that register/resolve concurrently with the async stream consumer.
+    threads that register concurrently with the async stream consumer.
     """
 
     def __init__(self, store: ContextStore) -> None:
         self._store = store
         self._lock = threading.Lock()
-        self._by_trace: OrderedDict[int, ActivityContext] = OrderedDict()
+        # Trace keys registered this turn — the context VALUE lives in the base
+        # ``ContextStore`` (exact resolution reads it there); this set exists
+        # only so ``sweep`` knows which trace keys to unregister at turn-exit.
+        self._by_trace: set[int] = set()
         # Every (workflow_id, activity_id) a `register()` call has EVER bound
         # in the current turn — kept independent of `_by_trace` (which loses
         # entries on `unregister`) so a completed activity's abort mark is
         # still swept even though its trace binding is long gone by turn-exit.
         self._activity_keys: set[tuple[str | None, str | None]] = set()
-        self.metrics = ContextMissMetrics()
 
     @property
     def store(self) -> ContextStore:
         return self._store
 
     def register(self, trace_id: int | str, ctx: ActivityContext) -> None:
-        """Register a trace-only binding (mirrors the legacy span processor).
+        """Register an EXACT trace binding: a known trace id -> a known activity.
 
         No ContextVar bind here by design: LangGraph tool/LLM execution runs
         in a spawned ``asyncio.Task`` or executor thread that already copied
@@ -107,10 +82,7 @@ class TraceContextRegistry:
         key = canonical_trace_key(trace_id)
         self._store.register_trace(key, ctx)
         with self._lock:
-            # Re-insert to move to the end — "most recently registered" for
-            # the last-registered fallback tier stays accurate on re-registration.
-            self._by_trace.pop(key, None)
-            self._by_trace[key] = ctx
+            self._by_trace.add(key)
             self._activity_keys.add((ctx.workflow_id, ctx.activity_id))
 
     def unregister(self, trace_id: int | str) -> None:
@@ -118,7 +90,7 @@ class TraceContextRegistry:
         key = canonical_trace_key(trace_id)
         self._store.unregister_trace(key)
         with self._lock:
-            self._by_trace.pop(key, None)
+            self._by_trace.discard(key)
 
     def sweep(self, workflow_id: str | None = None) -> None:
         """Drop ALL bindings + turn-scoped bookkeeping (turn-exit cleanup).
@@ -135,7 +107,7 @@ class TraceContextRegistry:
         so this registry supplies the missing per-turn sweep instead.
         """
         with self._lock:
-            keys = list(self._by_trace.keys())
+            keys = list(self._by_trace)
             self._by_trace.clear()
             activity_keys = (
                 [k for k in self._activity_keys if k[0] == workflow_id]
@@ -166,35 +138,6 @@ class TraceContextRegistry:
             keys = [k for k in self._activity_keys if k[0] == workflow_id]
         for wf_id, activity_id in keys:
             self._store.clear_activity_aborted(wf_id, activity_id)
-
-    def resolve(self, trace_id: int | str) -> ActivityContext | None:
-        """Exact-trace -> single-active -> last-registered, fail-loud on total miss.
-
-        Mirrors ``WorkflowSpanProcessor.get_activity_context_by_trace``'s
-        fallback ladder against this registry's own bookkeeping (see class
-        docstring for why the base ``ContextStore`` cannot supply tiers 2/3).
-        A miss across every tier is logged at WARNING and counted in
-        ``self.metrics`` — never a silent skip, since a governed operation
-        that resolves no context runs ungoverned.
-        """
-        key = canonical_trace_key(trace_id)
-        with self._lock:
-            exact = self._by_trace.get(key)
-            if exact is not None:
-                return exact
-            if len(self._by_trace) == 1:
-                return next(iter(self._by_trace.values()))
-            if self._by_trace:
-                return next(reversed(self._by_trace.values()))
-        _logger.warning(
-            "openbox_langgraph.trace_context_registry: no ActivityContext resolved "
-            "for trace_id=%s across exact/single-active/last-registered fallback "
-            "tiers — this operation is running WITHOUT core-instrumentation "
-            "governance context",
-            key,
-        )
-        self.metrics.record_miss(key)
-        return None
 
 
 # Runtime -> registry, so `langgraph_handler.py` can dual-write via
@@ -234,24 +177,10 @@ def get_trace_registry(runtime: OpenBoxRuntime) -> TraceContextRegistry:
     -per-runtime isolation guarantee ``core_runtime.create_core_runtime``
     provides. Keyed on the runtime OBJECT itself (weakly) — see the
     `_registries` module comment for why an `id()`-keyed cache is unsafe here.
-
-    When ``runtime.context_store`` already owns a ``registry`` attribute that
-    IS a ``TraceContextRegistry`` (``fallback_context_store.FallbackContextStore``
-    — checked by duck type, not import, to avoid a circular import with that
-    module), THAT SAME instance is reused instead of creating a second,
-    independent one bound to the identical store: the store's own
-    ``context_for_trace`` override consults exactly that registry's fallback
-    ladder, so a caller-side dual-write (``register``/``unregister`` via this
-    function) MUST land on the one instance the store itself resolves
-    through, not a shadow copy that would always report a miss.
     """
     with _registries_lock:
         registry = _registries.get(runtime)
         if registry is None:
-            owned = getattr(runtime.context_store, "registry", None)
-            registry = (
-                owned if isinstance(owned, TraceContextRegistry)
-                else TraceContextRegistry(runtime.context_store)
-            )
+            registry = TraceContextRegistry(runtime.context_store)
             _registries[runtime] = registry
         return registry

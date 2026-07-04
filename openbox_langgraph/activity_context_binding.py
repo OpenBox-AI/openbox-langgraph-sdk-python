@@ -58,6 +58,7 @@ def build_activity_context(
     langgraph_step: int | None = None,
     tool_type: str | None = None,
     tool_name: str | None = None,
+    tool_call_id: str | None = None,
     subagent_name: str | None = None,
     parent_ids: list[str] | None = None,
 ) -> ActivityContext:
@@ -79,6 +80,8 @@ def build_activity_context(
         metadata["tool_type"] = tool_type
     if tool_name is not None:
         metadata["tool_name"] = tool_name
+    if tool_call_id is not None:
+        metadata["tool_call_id"] = tool_call_id
     if subagent_name is not None:
         metadata["subagent_name"] = subagent_name
     if parent_ids:

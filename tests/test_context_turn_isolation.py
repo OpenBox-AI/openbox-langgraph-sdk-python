@@ -120,10 +120,9 @@ async def test_two_sequential_ainvoke_turns_use_distinct_workflow_ids() -> None:
 @pytest.mark.asyncio
 async def test_second_turn_never_resolves_first_turns_registered_context() -> None:
     """After turn 1 completes (and its cleanup sweeps), the registry has zero
-    entries; while turn 2 is IN FLIGHT, resolving any trace id the registry
-    currently knows about must return turn 2's context, never turn 1's — the
-    single-active fallback tier in particular would silently leak turn 1's
-    identity into turn 2 if cleanup didn't actually run between them."""
+    entries; while turn 2 is IN FLIGHT, an EXACT trace lookup must return turn
+    2's context, never turn 1's — turn 1's bindings must be fully swept so a
+    later turn's trace can only resolve its own identity."""
     handler = _build_handler_with_core_runtime()
     registry = get_trace_registry(handler._core_runtime)  # type: ignore[arg-type]
 
@@ -152,7 +151,7 @@ async def test_second_turn_never_resolves_first_turns_registered_context() -> No
 
     def _spy_register(trace_id: Any, ctx: Any) -> None:
         original_register(trace_id, ctx)
-        resolved_mid_turn_two.append(registry.resolve(trace_id))
+        resolved_mid_turn_two.append(registry.store.context_for_trace(trace_id))
 
     registry.register = _spy_register  # type: ignore[method-assign]
     try:
@@ -262,7 +261,7 @@ async def test_abandoned_generator_from_first_turn_does_not_leak_into_second() -
 
     def _spy_register(trace_id: Any, ctx: Any) -> None:
         original_register(trace_id, ctx)
-        resolved_mid_turn_two.append(registry.resolve(trace_id))
+        resolved_mid_turn_two.append(registry.store.context_for_trace(trace_id))
 
     registry.register = _spy_register  # type: ignore[method-assign]
     try:

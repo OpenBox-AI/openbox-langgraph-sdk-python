@@ -95,6 +95,22 @@ class GovernanceConfig:
     instrumentation — the only hook runtime. Default ``True``. Setting it
     ``False`` fails fast (``OpenBoxConfigError``): legacy in-repo hook
     governance has been removed, so there is nothing to fall back to."""
+    strict_activity_context: bool = False
+    """Fail loudly when a tool cannot be bound to a proven ActivityContext.
+
+    A tool run is bindable only inside a governed turn — the handler supplies
+    the turn's ``workflow_id``/``run_id`` down each tool's ``RunnableConfig``.
+    When that turn identity is absent (e.g. a tool driven outside the handler),
+    the ToolNode binder cannot prove which activity a hook span belongs to.
+
+    Default ``False``: log a warning once per such invocation and execute the
+    tool UNBOUND (its hook spans stay intentionally unattached — never guessed).
+    ``True`` (a test/debug aid): raise ``OpenBoxConfigError`` BEFORE the tool
+    body runs, so the tool never executes unbound. Note the raise is thrown from
+    inside the ``ToolNode`` call, so a ``ToolNode`` with the default
+    ``handle_tool_errors=True`` converts it into an error ``ToolMessage``
+    (loud and visible, tool still not run) rather than propagating; build the
+    ``ToolNode`` with ``handle_tool_errors=False`` to make it hard-fail the run."""
     root_node_names: set[str] = field(default_factory=set)
     tool_type_map: dict[str, str] = field(default_factory=dict)
     """Optional mapping of tool name → tool_type for execution tree classification.
@@ -159,6 +175,7 @@ def merge_config(partial: dict[str, Any] | None = None) -> GovernanceConfig:
         task_queue=partial.get("task_queue", "langgraph"),
         use_native_interrupt=partial.get("use_native_interrupt", False),
         use_core_instrumentation=partial.get("use_core_instrumentation", True),
+        strict_activity_context=partial.get("strict_activity_context", False),
         root_node_names=_to_set(partial.get("root_node_names")),
         tool_type_map=tool_type_map,
     )

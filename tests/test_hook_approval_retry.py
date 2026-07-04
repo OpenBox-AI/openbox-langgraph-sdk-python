@@ -1,23 +1,22 @@
-"""The post-approval reset: REQUIRE_APPROVAL raises, `ainvoke`'s outer
-loop polls, approval resolves, `_reset_after_approval` clears the abort
-mark BEFORE the retry, and the retry runs GOVERNED (not short-circuited by
-the stale abort flag the blocked first pass left behind).
+"""The post-approval reset for the core-instrumentation path: a tool's HTTP
+hook returns REQUIRE_APPROVAL, `ainvoke`'s outer loop polls, approval resolves,
+`_reset_after_approval` clears the turn's abort marks, and the retry runs
+GOVERNED (its HTTP call reaches the server).
 
-Contrast with `tests/test_hook_approval_retry_baseline.py`, which PINS the
-legacy-only bug: nothing on that path ever called `clear_activity_abort`, so
-a real hook-governed retry (unlike that baseline's simulated in-graph raise)
-would stay blocked forever. This module proves the FIX for the opt-in
-core-instrumentation path specifically — the flag-off legacy path's bug
-remains exactly as pinned, untouched.
+The tool's HTTP hook resolves its activity via the ContextVar tier bound at the
+ToolNode seam (see `tool_activity_binding`) — there is no single-active/
+last-registered fallback. Two tests here: the end-to-end approved-retry-runs
+(`test_approved_retry_runs_governed_not_short_circuited`), and a focused unit
+check that `reset_after_approval` actually clears a workflow's abort marks
+(`test_reset_after_approval_clears_the_turns_abort_marks`).
 
 Uses REAL base instrumentation (`openbox_core.conformance`) against a REAL
-local HTTP server so "GOVERNED" and "blocked" are observed as actual
-requests reaching (or not reaching) the server — not a re-implementation of
-the hook runtime's own decision logic. The handler's `_core_runtime` is set
-to the EXACT runtime object `installed_conformance_runtime` installs (not a
-second, separate one) so the real, globally-published `HookRuntime` the
-instrumented `requests` library calls into shares the same adapter/store the
-test's assertions inspect.
+local HTTP server so "GOVERNED" is observed as an actual request reaching the
+server — not a re-implementation of the hook runtime's own decision logic. The
+handler's `_core_runtime` is set to the EXACT runtime object
+`installed_conformance_runtime` installs (not a second, separate one) so the
+real, globally-published `HookRuntime` the instrumented `requests` library
+calls into shares the same adapter/store the test's assertions inspect.
 """
 
 from __future__ import annotations
@@ -40,14 +39,17 @@ from openbox_core.conformance.instrumentation import (
     LocalCountingServer,
     installed_conformance_runtime,
 )
+from openbox_core.context import ContextStore
+from openbox_core.contracts.context import ActivityContext
 
 from openbox_langgraph.client import GovernanceClient
 from openbox_langgraph.core_adapter import LangGraphFrameworkAdapter
-from openbox_langgraph.fallback_context_store import FallbackContextStore
+from openbox_langgraph.core_runtime import get_trace_registry
 from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     OpenBoxLangGraphHandlerOptions,
 )
+from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope
 from openbox_langgraph.types import GovernanceVerdictResponse, Verdict
 
 
@@ -139,15 +141,27 @@ def _build_tool_call_graph(url: str) -> Any:
 def _build_handler(graph: Any, runtime: Any) -> OpenBoxLangGraphHandler:
     """Injected client keeps `__init__` from building its own core runtime —
     `_core_runtime` is then pointed at the EXACT runtime
-    `installed_conformance_runtime` armed. `_process_event`'s tool-span
-    creation + base trace registration is gated on
-    `should_dual_write(self._core_runtime)`, so pointing `_core_runtime` at a
-    real runtime is all that's needed for hooks to resolve a bound context.
+    `installed_conformance_runtime` armed.
+
+    Because the injected-client path skips `__init__`'s tool binding, we bind
+    the graph's ToolNode here explicitly: the sync `http_tool` runs via
+    `run_in_executor`, which does NOT carry an OTel parent context, so the base
+    exact-trace tier alone misses (a fresh root-span trace_id) — the ContextVar
+    tier bound at the ToolNode seam is what resolves the tool's HTTP hook to its
+    activity. `store.registry` is published so `reset_after_approval` can sweep
+    the turn's abort marks (matching what `create_core_runtime` wires up).
     """
     handler = OpenBoxLangGraphHandler(
         graph=graph, options=OpenBoxLangGraphHandlerOptions(client=_AllowEverythingClient())
     )
     handler._core_runtime = runtime  # type: ignore[attr-defined]
+    runtime.context_store.registry = get_trace_registry(runtime)
+    bind_tools_activity_scope(
+        graph,
+        core_runtime=runtime,
+        config=handler._config,  # type: ignore[attr-defined]
+        resolve_tool_type=lambda name: None,
+    )
     return handler
 
 
@@ -157,14 +171,11 @@ async def test_approved_retry_runs_governed_not_short_circuited(server) -> None:
     pass must not silently short-circuit the approved retry with a fabricated
     'already aborted' block that never even asks Core again."""
     fake_core = FakeCore({"verdict": "require_approval", "approval_id": "app-1"})
-    # FallbackContextStore, NOT a plain ContextStore: LangGraph's ToolNode
-    # runs a sync tool via `run_in_executor` — the base SDK's exact-trace
-    # tier misses (fresh, unrelated trace_id on that thread), so the tool's
-    # HTTP call only resolves context through the fallback registry's
-    # single-active/last-registered tiers. Confirmed empirically: a plain
-    # ContextStore here makes every hook resolve "no bound context" and the
-    # whole REQUIRE_APPROVAL flow never triggers.
-    store = FallbackContextStore()
+    # Plain ContextStore, zero fallback: the sync tool's HTTP hook resolves
+    # via the ContextVar tier bound at the ToolNode seam (see _build_handler),
+    # not a single-active/last-registered guess. `mock_poll.assert_awaited_once`
+    # below proves the first pass actually hit REQUIRE_APPROVAL.
+    store = ContextStore()
     adapter = LangGraphFrameworkAdapter(context_store=store)
     graph = _build_tool_call_graph(server.url)
 
@@ -191,34 +202,41 @@ async def test_approved_retry_runs_governed_not_short_circuited(server) -> None:
     assert result["messages"][-1].content == "done"  # the agent's final reply
 
 
-async def test_without_reset_the_retry_would_stay_blocked(server) -> None:
-    """Direct contrast proving the reset is what fixes it: an adapter whose
-    `reset_after_approval` is a no-op (standing in for the pre-fix behavior,
-    without touching the real fix) leaves the retry blocked before it ever
-    reaches the server — same shape of failure
-    `test_hook_approval_retry_baseline.py` pins for the legacy path."""
+def test_reset_after_approval_clears_the_turns_abort_marks(server) -> None:
+    """The reset mechanism itself: `reset_after_approval(workflow_id)` clears
+    every abort mark registered under that workflow this turn.
 
-    class _NoResetAdapter(LangGraphFrameworkAdapter):
-        def reset_after_approval(self, workflow_id: str | None) -> None:
-            return None
-
-    fake_core = FakeCore({"verdict": "require_approval", "approval_id": "app-2"})
-    store = FallbackContextStore()  # see the other test's comment for why
-    adapter = _NoResetAdapter(context_store=store)
-    graph = _build_tool_call_graph(server.url)
+    With zero fallback, a retry mints its OWN fresh activity id and re-evaluates
+    from scratch (no stale-mark short-circuit resolved by guessing), so the old
+    end-to-end 'without reset the retry stays blocked' contrast no longer holds
+    — that blocking was the single-active fallback the plan removed. This is the
+    focused replacement: register an activity, mark it aborted, reset, assert it
+    is cleared — proving the workflow-scoped sweep `_reset_after_approval` calls
+    still does its job on a plain ContextStore + published registry."""
+    fake_core = FakeCore()
+    store = ContextStore()
+    adapter = LangGraphFrameworkAdapter(context_store=store)
 
     with installed_conformance_runtime(fake_core, adapter, store) as runtime:
-        handler = _build_handler(graph, runtime)
-        with patch(
-            "openbox_langgraph.langgraph_handler.poll_until_decision",
-            new=AsyncMock(return_value=None),
-        ):
-            before = server.hits
-            with pytest.raises(Exception):  # noqa: B017 — any stop-shaped governance error
-                await handler.ainvoke(
-                    {"messages": [HumanMessage(content="please fetch it")]},
-                    config={"configurable": {"thread_id": "approval-no-reset-thread"}},
-                )
-    # Without the reset, the retry's tool call never reaches the server —
-    # blocked by the stale abort mark from the first pass.
-    assert server.hits == before
+        store.registry = get_trace_registry(runtime)
+        workflow_id = "reset-workflow"
+        ctx = ActivityContext(
+            workflow_id=workflow_id,
+            run_id="reset-run",
+            workflow_type="ResetWorkflow",
+            task_queue="langgraph",
+            activity_id="reset-activity",
+            activity_type="http_tool",
+        )
+        # Registering via the published registry records the activity key the
+        # workflow-scoped sweep later clears.
+        store.registry.register(trace_id=12345, ctx=ctx)
+        store.mark_activity_aborted(workflow_id, "reset-activity")
+        assert store.is_activity_aborted(workflow_id, "reset-activity")
+
+        adapter.reset_after_approval(workflow_id)
+
+        assert not store.is_activity_aborted(workflow_id, "reset-activity"), (
+            "reset_after_approval must clear the turn's abort marks so an "
+            "approved retry runs governed"
+        )

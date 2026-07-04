@@ -1,6 +1,6 @@
 """Regression: a source hook span's ActivityContext is pinned at STARTED and
-reused at COMPLETED, so the trace-lookup fallback drifting to a later activity
-cannot split one span across two activity_ids.
+reused at COMPLETED, so a store trace-map that re-resolves to a later activity
+between the two stages cannot split one span across two activity_ids.
 
 Drives `LangGraphHookRuntime` directly (no real HTTP): the store's trace map is
 mutated between the started and completed stages to reproduce the exact drift
@@ -18,12 +18,12 @@ pytest.importorskip("openbox_core")
 
 from openbox_core.conformance.fake_core import FakeCore
 from openbox_core.conformance.instrumentation import installed_conformance_runtime
+from openbox_core.context import ContextStore
 from openbox_core.contracts.context import ActivityContext
 from openbox_core.contracts.otel_spans import HookType
 from opentelemetry import trace as otel_trace
 
 from openbox_langgraph.core_adapter import LangGraphFrameworkAdapter
-from openbox_langgraph.fallback_context_store import FallbackContextStore
 from openbox_langgraph.langgraph_hook_runtime import LangGraphHookRuntime
 
 _HOOK = HookType.HTTP_REQUEST
@@ -50,7 +50,7 @@ def _real_span(name: str):
 
 def test_completed_reuses_pinned_context_despite_store_drift() -> None:
     fake = FakeCore()  # empty queue → every verdict ALLOW
-    store = FallbackContextStore()
+    store = ContextStore()
     adapter = LangGraphFrameworkAdapter(context_store=store)
     with installed_conformance_runtime(fake, adapter, store) as rt:
         hookrt = LangGraphHookRuntime(rt)
@@ -73,7 +73,7 @@ def test_completed_reuses_pinned_context_despite_store_drift() -> None:
 def test_completed_without_started_pin_uses_resolver() -> None:
     """No prior preflight pin → completed falls back to normal resolution."""
     fake = FakeCore()
-    store = FallbackContextStore()
+    store = ContextStore()
     adapter = LangGraphFrameworkAdapter(context_store=store)
     with installed_conformance_runtime(fake, adapter, store) as rt:
         hookrt = LangGraphHookRuntime(rt)
@@ -87,7 +87,7 @@ def test_completed_without_started_pin_uses_resolver() -> None:
 
 async def test_acompleted_reuses_pinned_context_despite_store_drift() -> None:
     fake = FakeCore()
-    store = FallbackContextStore()
+    store = ContextStore()
     adapter = LangGraphFrameworkAdapter(context_store=store)
     with installed_conformance_runtime(fake, adapter, store) as rt:
         hookrt = LangGraphHookRuntime(rt)
@@ -110,7 +110,7 @@ def test_completed_block_marks_abort_on_pinned_activity_not_drifted() -> None:
     base `_after_completed`/`_mark_stopped` resolves the pinned context (bound
     via activity_scope) rather than re-resolving the drifted trace map."""
     fake = FakeCore({"verdict": "allow"}, {"verdict": "block", "reason": "post-hoc"})
-    store = FallbackContextStore()
+    store = ContextStore()
     adapter = LangGraphFrameworkAdapter(context_store=store)
     with installed_conformance_runtime(fake, adapter, store) as rt:
         hookrt = LangGraphHookRuntime(rt)
