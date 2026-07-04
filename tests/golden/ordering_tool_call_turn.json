@@ -20,7 +20,7 @@
     "event_type": "ToolStarted"
   },
   {
-    "activity_id": "<ID>-c",
+    "activity_id": "<ID>",
     "event_type": "ToolCompleted"
   },
   {

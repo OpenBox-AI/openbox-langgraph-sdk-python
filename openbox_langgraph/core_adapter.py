@@ -165,11 +165,13 @@ class LangGraphFrameworkAdapter:
         re-invoking the graph — never before the poll (that would let a
         second concurrent hook evaluation ignore the still-pending approval).
 
-        Clears the base store — via the owning ``FallbackContextStore.registry``
-        when present (duck-typed: checked by attribute, not import, to avoid a
-        circular import with that module), else a direct
-        ``clear_activity_aborted`` using the ambient bound context as a
-        best-effort single-activity fallback.
+        Clears the base store — via the ``TraceContextRegistry`` published on
+        the store as ``store.registry`` (``create_core_runtime`` sets it to the
+        runtime's registry; duck-typed by attribute, not import, to avoid a
+        circular import), which sweeps every activity key registered this turn.
+        Falls back to a direct ``clear_activity_aborted`` on the ambient bound
+        context when no registry is published (a store built outside
+        ``create_core_runtime``).
 
         No-op when ``workflow_id`` is falsy (nothing is ever keyed on it).
         """

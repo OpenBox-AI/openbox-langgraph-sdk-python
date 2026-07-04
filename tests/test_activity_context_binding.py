@@ -1,23 +1,25 @@
-"""The ActivityContext is bound around ACTUAL tool execution.
+"""The base-SDK ``ActivityContext`` is bound around ACTUAL tool execution at
+the LangGraph ``ToolNode`` request seam, with an id that matches the tool's own
+lifecycle ``on_tool_start`` run id exactly.
 
-Drives a REAL compiled LangGraph graph through the REAL
-``OpenBoxLangGraphHandler`` (non-injected, ``use_core_instrumentation=True``)
-and asserts that WHILE a tool body runs, the runtime's private
-``ContextStore`` resolves that tool's ``ActivityContext`` via its ContextVar
-tier — the exact tier ``openbox_core.hooks.events.resolve_context`` consults
-FIRST. So any HTTP/file/db hook the tool triggers resolves to that tool.
+The binder (``tool_activity_binding``) mints a canonical id, WRITES it into the
+tool's ``config["run_id"]`` so ``on_tool_start`` (hence ``ToolStarted.activity_id``
+in the handler) carries it, and runs the tool inside
+``openbox_core.context.activity_scope(ctx, store=...)``. ``resolve_context``
+checks that ContextVar tier FIRST, so any HTTP/file/db hook fired inside the
+tool resolves to THIS tool's exact activity — no minted-but-unmatched id, no
+single-active/last-registered guessing.
 
-A probe tool reads ``store.current_activity_context()`` from inside its own
-body (that is precisely what a base hook sees) and also performs a real
-``Path.read_text`` to confirm nothing errors on the instrumented path.
-
-Binding is done by wrapping the graph's tools (``tool_activity_scope``), NOT by
-a callback: LangChain isolates callback context from the tool body, so a
-callback bind never reaches the hooks.
+These tests drive REAL compiled LangGraph graphs. Where they need to compare
+the bound context against the lifecycle event id, they capture BOTH the
+``on_tool_start``/``on_tool_end`` run ids (from ``astream_events``) and the
+``ActivityContext`` the tool body resolves mid-execution — the exact identity a
+base hook would resolve.
 """
 
 from __future__ import annotations
 
+import asyncio
 import http.server
 import json
 import threading
@@ -33,8 +35,333 @@ from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from openbox_core.context import ContextStore
 
+from openbox_langgraph.config import GovernanceConfig
+from openbox_langgraph.errors import OpenBoxConfigError
 from openbox_langgraph.langgraph_handler import create_openbox_graph_handler
+from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope, turn_metadata
+
+
+class _AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+class _RT:
+    """Minimal stand-in for the parts of an OpenBoxRuntime the binder reads."""
+
+    def __init__(self, store: ContextStore) -> None:
+        self.context_store = store
+
+
+# ─────────────────────────────────────────────────────────────
+# Direct-graph harness: capture lifecycle run ids + bound contexts
+# ─────────────────────────────────────────────────────────────
+
+
+def _build_bound_graph(
+    tools: list[Any],
+    tool_calls: list[dict[str, Any]],
+    *,
+    store: ContextStore,
+    config: GovernanceConfig | None = None,
+    handle_tool_errors: bool = True,
+) -> Any:
+    """A model→tools→model graph whose ToolNode is bound by the OpenBox binder.
+
+    The model emits ``tool_calls`` on the first pass, then finishes. Binding is
+    applied to the compiled graph exactly as the handler applies it.
+    """
+    tool_node = ToolNode(tools, handle_tool_errors=handle_tool_errors)
+
+    def model(state: _AgentState) -> dict[str, Any]:
+        msgs = state["messages"]
+        if msgs and any(getattr(m, "type", None) == "tool" for m in msgs):
+            return {"messages": [AIMessage(content="done")]}
+        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+
+    def route(state: _AgentState) -> str:
+        return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
+
+    graph = StateGraph(_AgentState)
+    graph.add_node("model", model)
+    graph.add_node("tools", tool_node)
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+    graph.add_edge("tools", "model")
+    compiled = graph.compile()
+    bind_tools_activity_scope(
+        compiled,
+        core_runtime=_RT(store),
+        config=config or GovernanceConfig(),
+        resolve_tool_type=lambda name: None,
+    )
+    return compiled
+
+
+async def _drive(graph: Any, *, workflow_id: str | None = None, run_id: str | None = None) -> dict:
+    """Run the graph, returning on_tool_start/on_tool_end run ids by tool name."""
+    cfg: dict[str, Any] = {}
+    if workflow_id is not None and run_id is not None:
+        cfg["metadata"] = turn_metadata(workflow_id, run_id)
+    starts: dict[str, str] = {}
+    ends: dict[str, str] = {}
+    async for ev in graph.astream_events({"messages": []}, config=cfg, version="v2"):
+        if ev["event"] == "on_tool_start":
+            starts[ev["name"]] = str(ev["run_id"])
+        elif ev["event"] == "on_tool_end":
+            ends[ev["name"]] = str(ev["run_id"])
+    return {"starts": starts, "ends": ends}
+
+
+# ─────────────────────────────────────────────────────────────
+# 1 + 2: exact tool span activity id (no minted-but-unmatched uuid)
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_bound_activity_id_equals_on_tool_start_run_id() -> None:
+    """The context bound around the tool body carries the SAME id the tool's
+    ``on_tool_start`` event carries — so a hook resolving the bound context
+    reports the exact lifecycle ``ActivityStarted.activity_id``, never a fresh
+    unrelated uuid."""
+    store = ContextStore()
+    seen: dict[str, Any] = {}
+
+    @tool
+    def probe(query: str) -> str:
+        """Record the activity id resolved mid-body."""
+        ctx = store.current_activity_context()
+        seen["activity_id"] = ctx.activity_id if ctx else None
+        seen["activity_type"] = ctx.activity_type if ctx else None
+        return "ok"
+
+    graph = _build_bound_graph(
+        [probe], [{"name": "probe", "args": {"query": "x"}, "id": "call-1"}], store=store
+    )
+    result = await _drive(graph, workflow_id="wf-1", run_id="run-1")
+
+    assert seen["activity_type"] == "probe"
+    # The bound id is a real id that MATCHES the lifecycle event — not an
+    # unrelated minted uuid, and not None.
+    assert seen["activity_id"] is not None
+    assert seen["activity_id"] == result["starts"]["probe"]
+
+
+# ─────────────────────────────────────────────────────────────
+# 6: tool completion id parity
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_started_and_completed_share_one_activity_id() -> None:
+    """One id for the whole tool lifecycle: ``on_tool_start`` and ``on_tool_end``
+    carry the same run id (which the handler maps to ActivityStarted /
+    ActivityCompleted), and it equals the bound context id."""
+    store = ContextStore()
+    seen: dict[str, Any] = {}
+
+    @tool
+    def probe(query: str) -> str:
+        """Record the bound id."""
+        ctx = store.current_activity_context()
+        seen["activity_id"] = ctx.activity_id if ctx else None
+        return "ok"
+
+    graph = _build_bound_graph(
+        [probe], [{"name": "probe", "args": {"query": "x"}, "id": "call-1"}], store=store
+    )
+    result = await _drive(graph, workflow_id="wf-1", run_id="run-1")
+
+    assert result["starts"]["probe"] == result["ends"]["probe"]
+    assert seen["activity_id"] == result["starts"]["probe"]
+
+
+# ─────────────────────────────────────────────────────────────
+# 4: concurrent tool calls in one ToolNode each map to their own id
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_concurrent_tool_calls_each_bind_their_own_activity() -> None:
+    """Two tool calls dispatched together in ONE ToolNode: each tool body sees
+    ONLY its own bound context id, matching its own ``on_tool_start`` event —
+    zero cross-contamination."""
+    store = ContextStore()
+    seen: dict[str, str | None] = {}
+
+    @tool
+    async def alpha(query: str) -> str:
+        """Record alpha's bound id."""
+        await asyncio.sleep(0.02)  # force interleave with beta
+        ctx = store.current_activity_context()
+        seen["alpha"] = ctx.activity_id if ctx else None
+        return "alpha-done"
+
+    @tool
+    async def beta(query: str) -> str:
+        """Record beta's bound id."""
+        await asyncio.sleep(0.02)
+        ctx = store.current_activity_context()
+        seen["beta"] = ctx.activity_id if ctx else None
+        return "beta-done"
+
+    graph = _build_bound_graph(
+        [alpha, beta],
+        [
+            {"name": "alpha", "args": {"query": "a"}, "id": "call-a"},
+            {"name": "beta", "args": {"query": "b"}, "id": "call-b"},
+        ],
+        store=store,
+    )
+    result = await _drive(graph, workflow_id="wf-1", run_id="run-1")
+
+    assert seen["alpha"] == result["starts"]["alpha"]
+    assert seen["beta"] == result["starts"]["beta"]
+    assert seen["alpha"] != seen["beta"], "concurrent tool calls must not share an activity id"
+
+
+# ─────────────────────────────────────────────────────────────
+# 5: existing ToolNode wrappers compose
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_existing_toolnode_wrappers_still_run_inside_the_bound_scope() -> None:
+    """A user-provided ``wrap_tool_call``/``awrap_tool_call`` on the ToolNode
+    keeps running, and the OpenBox binding wraps the actual execute call around
+    it — the tool body still resolves the bound context."""
+    store = ContextStore()
+    order: list[str] = []
+    seen: dict[str, Any] = {}
+
+    async def user_awrap(request, execute):
+        order.append("user_awrap_enter")
+        try:
+            return await execute(request)
+        finally:
+            order.append("user_awrap_exit")
+
+    @tool
+    async def probe(query: str) -> str:
+        """Record the bound id from inside the user-wrapped tool."""
+        ctx = store.current_activity_context()
+        seen["activity_id"] = ctx.activity_id if ctx else None
+        return "ok"
+
+    tool_node = ToolNode([probe], awrap_tool_call=user_awrap)
+
+    def model(state: _AgentState) -> dict[str, Any]:
+        msgs = state["messages"]
+        if msgs and any(getattr(m, "type", None) == "tool" for m in msgs):
+            return {"messages": [AIMessage(content="done")]}
+        tool_calls = [{"name": "probe", "args": {"query": "x"}, "id": "c1"}]
+        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+
+    def route(state: _AgentState) -> str:
+        return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
+
+    graph = StateGraph(_AgentState)
+    graph.add_node("model", model)
+    graph.add_node("tools", tool_node)
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+    graph.add_edge("tools", "model")
+    compiled = graph.compile()
+    bind_tools_activity_scope(
+        compiled,
+        core_runtime=_RT(store),
+        config=GovernanceConfig(),
+        resolve_tool_type=lambda n: None,
+    )
+
+    result = await _drive(compiled, workflow_id="wf-1", run_id="run-1")
+
+    assert order == ["user_awrap_enter", "user_awrap_exit"], "user wrapper must run"
+    assert seen["activity_id"] == result["starts"]["probe"], "OpenBox binding still applies"
+
+
+# ─────────────────────────────────────────────────────────────
+# 7: strict vs default no-context policy
+# ─────────────────────────────────────────────────────────────
+
+
+async def test_strict_mode_raises_when_turn_context_cannot_be_proven() -> None:
+    """Driven WITHOUT turn metadata (no governed turn), strict mode raises
+    before executing the tool rather than running it unbound."""
+    store = ContextStore()
+
+    @tool
+    def probe(query: str) -> str:
+        """Should never run in strict mode without a turn."""
+        return "ok"
+
+    graph = _build_bound_graph(
+        [probe],
+        [{"name": "probe", "args": {"query": "x"}, "id": "c1"}],
+        store=store,
+        config=GovernanceConfig(strict_activity_context=True),
+        handle_tool_errors=False,  # let the strict raise propagate, not become a ToolMessage
+    )
+
+    with pytest.raises(OpenBoxConfigError):
+        await _drive(graph)  # no workflow_id/run_id → no turn metadata
+
+
+async def test_default_mode_executes_unbound_when_turn_context_absent(caplog) -> None:
+    """Default mode logs a warning once and runs the tool UNBOUND (its body
+    resolves no ActivityContext) rather than raising or fabricating a context."""
+    store = ContextStore()
+    seen: dict[str, Any] = {}
+
+    @tool
+    def probe(query: str) -> str:
+        """Record that no context is bound outside a governed turn."""
+        seen["ctx"] = store.current_activity_context()
+        return "ok"
+
+    graph = _build_bound_graph(
+        [probe], [{"name": "probe", "args": {"query": "x"}, "id": "c1"}], store=store
+    )
+
+    with caplog.at_level("WARNING", logger="openbox_langgraph.tool_activity_binding"):
+        await _drive(graph)  # no turn metadata
+
+    assert "ctx" in seen and seen["ctx"] is None, "no context should be bound"
+    assert any("executing tool UNBOUND" in r.message for r in caplog.records)
+
+
+# ─────────────────────────────────────────────────────────────
+# 3: no fallback guessing
+# ─────────────────────────────────────────────────────────────
+
+
+def test_two_registered_contexts_never_resolve_an_unrelated_trace() -> None:
+    """With TWO exact contexts registered and NO ContextVar bound, resolving a
+    trace id matching NEITHER returns None — the store never guesses one of the
+    two active activities (single-active/last-registered fallback is gone)."""
+    from openbox_core.contracts.context import ActivityContext
+
+    store = ContextStore()
+
+    def _ctx(activity_id: str) -> ActivityContext:
+        return ActivityContext(
+            workflow_id="wf",
+            run_id="run",
+            workflow_type="W",
+            task_queue="q",
+            activity_id=activity_id,
+            activity_type="probe",
+        )
+
+    store.register_trace(111, _ctx("act-A"))
+    store.register_trace(222, _ctx("act-B"))
+
+    # An unrelated trace id resolves NOTHING — not act-A, not act-B.
+    assert store.context_for_trace(999) is None
+    # And with no ContextVar bind, the primary tier is empty too.
+    assert store.current_activity_context() is None
+
+
+# ─────────────────────────────────────────────────────────────
+# Real handler path + idempotency
+# ─────────────────────────────────────────────────────────────
 
 
 class _FakeGovernanceApi:
@@ -79,10 +406,6 @@ def governance_api():
     srv.stop()
 
 
-class _AgentState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
-
-
 def _build_probe_graph(store_holder: dict[str, Any], captured: list[Any], probe_path):
     """react-style graph whose single tool records the bound ActivityContext."""
 
@@ -91,9 +414,7 @@ def _build_probe_graph(store_holder: dict[str, Any], captured: list[Any], probe_
         """Record the ActivityContext resolved from the runtime store mid-execution."""
         store = store_holder["store"]
         captured.append(store.current_activity_context())
-        # A real instrumented file op inside the tool body must not error and
-        # runs under the same bound context.
-        probe_path.read_text()
+        probe_path.read_text()  # a real instrumented file op under the bound context
         return "ok"
 
     model = FakeMessagesListChatModel(
@@ -123,6 +444,9 @@ def _build_probe_graph(store_holder: dict[str, Any], captured: list[Any], probe_
 
 @pytest.mark.asyncio
 async def test_tool_body_resolves_its_own_activity_context(governance_api, tmp_path) -> None:
+    """End to end through the REAL handler (non-injected, use_core_instrumentation):
+    while the tool body runs, the runtime's private ContextStore resolves THIS
+    tool's ActivityContext via the ContextVar tier — exactly what a base hook sees."""
     store_holder: dict[str, Any] = {}
     captured: list[Any] = []
     probe_path = tmp_path / "probe.txt"
@@ -143,8 +467,6 @@ async def test_tool_body_resolves_its_own_activity_context(governance_api, tmp_p
             config={"configurable": {"thread_id": "t-activity-ctx"}},
         )
 
-        # The tool ran, and mid-body the store resolved THIS tool's context via
-        # the ContextVar tier — exactly what a base HTTP/file hook resolves.
         assert captured, "probe_tool never executed"
         ctx = captured[0]
         assert ctx is not None, "no ActivityContext bound during tool execution"
@@ -159,8 +481,9 @@ async def test_tool_body_resolves_its_own_activity_context(governance_api, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_tools_are_wrapped_idempotently(governance_api, tmp_path) -> None:
-    """Building a second handler over the same graph must not double-wrap."""
+async def test_toolnode_bound_idempotently(governance_api, tmp_path) -> None:
+    """Building a second handler over the same graph must not re-wrap the
+    ToolNode — the composed wrappers from the first handler stay in place."""
     store_holder: dict[str, Any] = {}
     captured: list[Any] = []
     probe_path = tmp_path / "probe.txt"
@@ -168,80 +491,34 @@ async def test_tools_are_wrapped_idempotently(governance_api, tmp_path) -> None:
     graph = _build_probe_graph(store_holder, captured, probe_path)
 
     tool_node = graph.nodes["tools"].bound  # type: ignore[attr-defined]
-    probe = tool_node.tools_by_name["probe_tool"]
 
     h1 = create_openbox_graph_handler(
         graph=graph, api_url=governance_api.url, api_key="obx_test_idem1", validate=False,
         use_core_instrumentation=True,
     )
-    wrapped_once = probe.func
+    wrapped_async_once = tool_node._awrap_tool_call
+    wrapped_sync_once = tool_node._wrap_tool_call
     h2 = create_openbox_graph_handler(
         graph=graph, api_url=governance_api.url, api_key="obx_test_idem2", validate=False,
         use_core_instrumentation=True,
     )
     try:
-        assert getattr(probe, "_openbox_activity_scoped", False) is True
-        # Second wrap is a no-op — the func object is unchanged.
-        assert probe.func is wrapped_once
+        assert getattr(tool_node, "_openbox_activity_bound", False) is True
+        # Second bind is a no-op — the composed wrappers are unchanged.
+        assert tool_node._awrap_tool_call is wrapped_async_once
+        assert tool_node._wrap_tool_call is wrapped_sync_once
     finally:
         h1._core_runtime.close()  # type: ignore[union-attr]
         h2._core_runtime.close()  # type: ignore[union-attr]
 
 
-def test_no_turn_bound_outside_a_governed_turn() -> None:
-    """Calling a wrapped tool with no turn metadata in config must not raise and
-    must not fabricate a context (direct tool use outside a governed turn)."""
-    from openbox_core.context import ContextStore
-
-    from openbox_langgraph.config import GovernanceConfig
-    from openbox_langgraph.tool_activity_scope import wrap_graph_tools
-
-    captured: list[Any] = []
-    store = ContextStore()
-
-    @tool
-    def bare_tool(text: str) -> str:
-        """Probe that records the ambient context."""
-        captured.append(store.current_activity_context())
-        return "ok"
-
-    class _RT:
-        context_store = store
-
-    graph = StateGraph(_AgentState)
-    graph.add_node("tools", ToolNode([bare_tool]))
-    graph.add_edge(START, "tools")
-    graph.add_edge("tools", END)
-    compiled = graph.compile()
-    wrap_graph_tools(
-        compiled, core_runtime=_RT(), config=GovernanceConfig(), resolve_tool_type=lambda n: None
-    )
-
-    node_tool = compiled.nodes["tools"].bound.tools_by_name["bare_tool"]
-    assert node_tool.func("hi") == "ok"  # no turn metadata → passthrough, no raise
-    assert captured == [None]
-
-
 @pytest.mark.asyncio
 async def test_concurrent_turns_do_not_cross_contaminate() -> None:
-    """Two turns driven CONCURRENTLY each resolve their OWN workflow_id inside
-    the tool body. The per-turn ids ride the tool's own RunnableConfig (set per
-    invocation by BaseTool.arun), NOT a shared module ContextVar — so there is
-    no last-writer-wins cross-contamination. Uses two graphs sharing ONE store
-    (the hard case: the store's ContextVar bind must be per-execution-context).
-    """
-    import asyncio
-
-    from openbox_core.context import ContextStore
-
-    from openbox_langgraph.config import GovernanceConfig
-    from openbox_langgraph.tool_activity_scope import turn_metadata, wrap_graph_tools
-
+    """Two turns driven CONCURRENTLY on two graphs sharing ONE store each
+    resolve their OWN workflow_id inside the tool body — the per-turn ids ride
+    each tool's own RunnableConfig, not a shared module ContextVar."""
     store = ContextStore()
     seen: dict[str, str | None] = {}
-
-    class _RT:
-        context_store = store
 
     def build(tag: str) -> Any:
         @tool
@@ -274,8 +551,8 @@ async def test_concurrent_turns_do_not_cross_contaminate() -> None:
         g.add_conditional_edges("agent", cont, {"tools": "tools", END: END})
         g.add_edge("tools", "agent")
         compiled = g.compile()
-        wrap_graph_tools(
-            compiled, core_runtime=_RT(), config=GovernanceConfig(),
+        bind_tools_activity_scope(
+            compiled, core_runtime=_RT(store), config=GovernanceConfig(),
             resolve_tool_type=lambda n: None,
         )
         return compiled

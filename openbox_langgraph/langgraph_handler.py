@@ -43,7 +43,7 @@ from openbox_langgraph.errors import (
     GuardrailsValidationError,
 )
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
-from openbox_langgraph.tool_activity_scope import turn_metadata, wrap_graph_tools
+from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope, turn_metadata
 from openbox_langgraph.types import (
     GovernanceVerdictResponse,
     LangChainGovernanceEvent,
@@ -105,6 +105,8 @@ class _GuardrailsCallbackHandler(AsyncCallbackHandler):
         pre_screen_response: GovernanceVerdictResponse | None = None,
         pre_screen_activity_id: str | None = None,
         llm_activity_map: dict[str, str] | None = None,
+        llm_trace_map: dict[str, int] | None = None,
+        core_runtime: Any = None,
     ) -> None:
         super().__init__()
         self._client = client
@@ -119,6 +121,69 @@ class _GuardrailsCallbackHandler(AsyncCallbackHandler):
         self._llm_activity_map: dict[str, str] = (
             llm_activity_map if llm_activity_map is not None else {}
         )
+        # Shared dict: LangChain callback UUID -> OTel trace id registered by this
+        # callback before the actual LLM request starts. The stream-event fallback
+        # checks it so it does not install a second, later trace binding.
+        self._llm_trace_map: dict[str, int] = llm_trace_map if llm_trace_map is not None else {}
+        self._llm_trace_handles: dict[str, tuple[Any, Any]] = {}
+        self._core_runtime = core_runtime
+
+    def _start_and_register_llm_trace(
+        self,
+        *,
+        event_run_id: str,
+        activity_id: str,
+        prompt_text: str,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        """Create/register an active LLM trace before the HTTP request starts.
+
+        When no parent OTel span is already active, httpx would otherwise create
+        the first span itself, with a trace id this callback cannot know in
+        advance. Owning a short-lived parent span here makes that trace id known
+        and registered before base instrumentation sees the started stage.
+        """
+        if not should_dual_write(self._core_runtime):
+            return
+        llm_span = _otel_tracer.start_span(
+            "llm.call",
+            context=otel_context.Context(),
+            kind=otel_trace.SpanKind.INTERNAL,
+        )
+        token = otel_context.attach(otel_trace.set_span_in_context(llm_span))
+        span_ctx = llm_span.get_span_context()
+        trace_id = getattr(span_ctx, "trace_id", None)
+        if not isinstance(trace_id, int) or not trace_id:
+            otel_context.detach(token)
+            llm_span.end()
+            return
+        register_activity(
+            self._core_runtime,
+            trace_id,
+            build_activity_context(
+                config=self._config,
+                workflow_id=self._workflow_id,
+                run_id=self._run_id,
+                activity_id=activity_id,
+                activity_type="llm_call",
+                activity_input=[{"prompt": prompt_text}],
+                langgraph_node=(metadata or {}).get("langgraph_node"),
+                langgraph_step=(metadata or {}).get("langgraph_step"),
+            ),
+        )
+        self._llm_trace_map[event_run_id] = trace_id
+        self._llm_trace_handles[event_run_id] = (llm_span, token)
+
+    def _unregister_llm_trace(self, run_id: UUID | str) -> None:
+        event_run_id = str(run_id)
+        handle = self._llm_trace_handles.pop(event_run_id, None)
+        if handle is not None:
+            span, token = handle
+            otel_context.detach(token)
+            span.end()
+        trace_id = self._llm_trace_map.pop(event_run_id, None)
+        if trace_id and should_dual_write(self._core_runtime):
+            unregister_activity(self._core_runtime, trace_id)
 
     async def on_chat_model_start(
         self,
@@ -164,6 +229,18 @@ class _GuardrailsCallbackHandler(AsyncCallbackHandler):
             or "LLM"
         )
         event_run_id = str(run_id)
+        activity_id = (
+            self._pre_screen_activity_id
+            if self._pre_screen_response is not None and self._pre_screen_activity_id
+            else event_run_id
+        )
+        self._llm_activity_map[event_run_id] = activity_id
+        self._start_and_register_llm_trace(
+            event_run_id=event_run_id,
+            activity_id=activity_id,
+            prompt_text=prompt_text,
+            metadata=metadata,
+        )
 
         gov = LangChainGovernanceEvent(
             source="workflow-telemetry",
@@ -181,57 +258,81 @@ class _GuardrailsCallbackHandler(AsyncCallbackHandler):
             prompt=prompt_text,
         )
 
-        if self._pre_screen_response is not None:
-            # Reuse the pre-screen verdict for PII redaction — the pre-screen already
-            # created an ActivityStarted row (activity_id=run_id+"-pre").  Record that
-            # mapping so _process_event knows to attach the LLM span hook to THAT row
-            # rather than creating a new one with the callback UUID.
-            response = self._pre_screen_response
-            self._pre_screen_response = None
-            if self._pre_screen_activity_id:
-                self._llm_activity_map[event_run_id] = self._pre_screen_activity_id
-        else:
-            # No pre-screen (second+ LLM call, or pre-screen disabled) — create a
-            # new row with the callback UUID so the span hook has a row to attach to.
-            response = await self._client.evaluate_event(gov)
-            self._llm_activity_map[event_run_id] = event_run_id
-        if response is None:
-            return
+        response: GovernanceVerdictResponse | None
+        try:
+            if self._pre_screen_response is not None:
+                # Reuse the pre-screen verdict for PII redaction — the pre-screen already
+                # created an ActivityStarted row (activity_id=run_id+"-pre").  Record that
+                # mapping so _process_event knows to attach the LLM span hook to THAT row
+                # rather than creating a new one with the callback UUID.
+                response = self._pre_screen_response
+                self._pre_screen_response = None
+            else:
+                # No pre-screen (second+ LLM call, or pre-screen disabled) — create a
+                # new row with the callback UUID so the span hook has a row to attach to.
+                response = await self._client.evaluate_event(gov)
+            if response is None:
+                return
 
-        # NOTE: enforce_verdict / HITL are intentionally NOT called here.
-        # LangGraph's graph runner catches callback exceptions even with raise_error=True
-        # and logs them as warnings instead of propagating them to the caller.
-        # Block/halt/guardrail enforcement is done in _pre_screen_input() which runs
-        # directly in ainvoke/astream_governed before the stream starts.
-        #
-        # This callback handler's only job is PII redaction (in-place message mutation).
+            # NOTE: enforce_verdict / HITL are intentionally NOT called here.
+            # LangGraph's graph runner catches callback exceptions even with raise_error=True
+            # and logs them as warnings instead of propagating them to the caller.
+            # Block/halt/guardrail enforcement is done in _pre_screen_input() which runs
+            # directly in ainvoke/astream_governed before the stream starts.
+            #
+            # This callback handler's only job is PII redaction (in-place message mutation).
 
-        # Apply PII redaction: mutate messages in-place before the LLM call fires
-        gr = response.guardrails_result
-        if gr and gr.input_type == "activity_input" and gr.redacted_input is not None:
-            redacted = gr.redacted_input
-            # Core returns [{"prompt": "..."}] — extract the prompt string
-            if isinstance(redacted, list) and redacted:
-                first = redacted[0]
-                if isinstance(first, dict):
-                    redacted_text = first.get("prompt")
-                elif isinstance(first, str):
-                    redacted_text = first
+            # Apply PII redaction: mutate messages in-place before the LLM call fires
+            gr = response.guardrails_result
+            if gr and gr.input_type == "activity_input" and gr.redacted_input is not None:
+                redacted = gr.redacted_input
+                # Core returns [{"prompt": "..."}] — extract the prompt string
+                if isinstance(redacted, list) and redacted:
+                    first = redacted[0]
+                    if isinstance(first, dict):
+                        redacted_text = first.get("prompt")
+                    elif isinstance(first, str):
+                        redacted_text = first
+                    else:
+                        redacted_text = None
+                elif isinstance(redacted, str):
+                    redacted_text = redacted
                 else:
                     redacted_text = None
-            elif isinstance(redacted, str):
-                redacted_text = redacted
-            else:
-                redacted_text = None
 
-            if redacted_text:
-                # Replace the last human message in each message group
-                for group in messages:
-                    for j in range(len(group) - 1, -1, -1):
-                        msg = group[j]
-                        if msg.type in ("human", "generic"):
-                            msg.content = redacted_text  # type: ignore[assignment]
-                            break
+                if redacted_text:
+                    # Replace the last human message in each message group
+                    for group in messages:
+                        for j in range(len(group) - 1, -1, -1):
+                            msg = group[j]
+                            if msg.type in ("human", "generic"):
+                                msg.content = redacted_text  # type: ignore[assignment]
+                                break
+        except BaseException:
+            self._unregister_llm_trace(run_id)
+            raise
+
+    async def on_llm_end(
+        self,
+        response: Any,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._unregister_llm_trace(run_id)
+
+    async def on_llm_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._unregister_llm_trace(run_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -473,14 +574,17 @@ class OpenBoxLangGraphHandler:
                 agent_private_key=gc.agent_private_key,
                 gate=self._core_runtime.gate,
             )
-            # Bind the base-SDK ActivityContext around ACTUAL tool execution:
-            # wrap each tool so its body runs inside activity_scope on this
-            # runtime's private store. Hooks fired inside a tool then resolve to
-            # that tool via the ContextVar tier (the primary mechanism), instead
-            # of the trace-lookup fallback. Best-effort + idempotent; injected-
-            # client (lifecycle-only) handlers skip this — they own no store.
+            # Bind the base-SDK ActivityContext around ACTUAL tool execution at
+            # the ToolNode request seam: mint a canonical activity id, write it
+            # to the tool's config["run_id"] so on_tool_start (thus
+            # ToolStarted.activity_id) carries it, and run execute() inside
+            # activity_scope on this runtime's private store. Hooks fired inside
+            # a tool then resolve to that exact activity via the ContextVar tier
+            # (the primary mechanism), instead of the trace-lookup fallback.
+            # Best-effort + idempotent; injected-client (lifecycle-only)
+            # handlers skip this — they own no store.
             if graph is not None:
-                wrap_graph_tools(
+                bind_tools_activity_scope(
                     graph,
                     core_runtime=self._core_runtime,
                     config=self._config,
@@ -703,7 +807,7 @@ class OpenBoxLangGraphHandler:
         run_id: str,
         thread_id: str,
         pre_screen_response: GovernanceVerdictResponse | None,
-    ) -> tuple[dict[str, Any], dict[str, str]]:
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, int]]:
         """Build the RunnableConfig with this turn's guardrails callback.
 
         The ``_GuardrailsCallbackHandler`` does pre-LLM PII redaction and owns
@@ -712,12 +816,13 @@ class OpenBoxLangGraphHandler:
 
         Note: tool-execution ``ActivityContext`` binding is NOT done via a
         callback — LangChain isolates callback context from the tool body, so a
-        callback bind never reaches the hooks. It is done by wrapping the graph's
-        tools (see ``tool_activity_scope``); this method threads the per-turn
+        callback bind never reaches the hooks. It is done at the ToolNode request
+        seam (see ``tool_activity_binding``); this method threads the per-turn
         ids down to those wrappers via ``config["metadata"]`` (a per-invocation
         channel, concurrency-safe — unlike a shared module ContextVar).
         """
         llm_activity_map: dict[str, str] = {}
+        llm_trace_map: dict[str, int] = {}
         guardrails_cb = _GuardrailsCallbackHandler(
             client=self._client,
             config=self._config,
@@ -727,6 +832,8 @@ class OpenBoxLangGraphHandler:
             pre_screen_response=pre_screen_response,
             pre_screen_activity_id=f"{run_id}-pre" if pre_screen_response is not None else None,
             llm_activity_map=llm_activity_map,
+            llm_trace_map=llm_trace_map,
+            core_runtime=self._core_runtime,
         )
         cfg = dict(config or {})
         cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
@@ -735,7 +842,7 @@ class OpenBoxLangGraphHandler:
         # runtime owns a store to bind on; merged so user metadata survives.
         if self._core_runtime is not None:
             cfg["metadata"] = {**(cfg.get("metadata") or {}), **turn_metadata(workflow_id, run_id)}
-        return cfg, llm_activity_map
+        return cfg, llm_activity_map, llm_trace_map
 
     # ─────────────────────────────────────────────────────────────
     # Public invoke / ainvoke
@@ -780,7 +887,7 @@ class OpenBoxLangGraphHandler:
             input, workflow_id, run_id
         )
 
-        cfg, llm_activity_map = self._governed_config(
+        cfg, llm_activity_map, llm_trace_map = self._governed_config(
             config,
             workflow_id=workflow_id,
             run_id=run_id,
@@ -795,7 +902,9 @@ class OpenBoxLangGraphHandler:
                 stream_event = LangGraphStreamEvent.from_dict(event)
                 await self._process_event(
                     stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
-                    workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
+                    workflow_started_sent=workflow_started_sent,
+                    llm_activity_map=llm_activity_map,
+                    llm_trace_map=llm_trace_map,
                 )
                 # Capture the root graph's final output from on_chain_end
                 if (
@@ -869,7 +978,7 @@ class OpenBoxLangGraphHandler:
             input, workflow_id, run_id
         )
 
-        cfg, llm_activity_map = self._governed_config(
+        cfg, llm_activity_map, llm_trace_map = self._governed_config(
             config,
             workflow_id=workflow_id,
             run_id=run_id,
@@ -890,7 +999,9 @@ class OpenBoxLangGraphHandler:
                     )
                 await self._process_event(
                     stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
-                    workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
+                    workflow_started_sent=workflow_started_sent,
+                    llm_activity_map=llm_activity_map,
+                    llm_trace_map=llm_trace_map,
                 )
                 yield event
         finally:
@@ -959,7 +1070,7 @@ class OpenBoxLangGraphHandler:
             input, workflow_id, run_id
         )
 
-        cfg, llm_activity_map = self._governed_config(
+        cfg, llm_activity_map, llm_trace_map = self._governed_config(
             config,
             workflow_id=workflow_id,
             run_id=run_id,
@@ -974,7 +1085,9 @@ class OpenBoxLangGraphHandler:
                 stream_event = LangGraphStreamEvent.from_dict(event)
                 await self._process_event(
                     stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
-                    workflow_started_sent=workflow_started_sent, llm_activity_map=llm_activity_map,
+                    workflow_started_sent=workflow_started_sent,
+                    llm_activity_map=llm_activity_map,
+                    llm_trace_map=llm_trace_map,
                 )
                 yield event
         finally:
@@ -998,10 +1111,13 @@ class OpenBoxLangGraphHandler:
         *,
         workflow_started_sent: bool = False,
         llm_activity_map: dict[str, str] | None = None,
+        llm_trace_map: dict[str, int] | None = None,
     ) -> None:
         """Process a single LangGraph stream event through governance."""
         gov_event, is_root, is_start, event_type_label = self._map_event(
-            event, thread_id, workflow_id, run_id, root_tracker, buffer
+            event, thread_id, workflow_id, run_id, root_tracker, buffer,
+            llm_activity_map=llm_activity_map,
+            llm_trace_map=llm_trace_map,
         )
         if gov_event is None:
             return
@@ -1173,6 +1289,9 @@ class OpenBoxLangGraphHandler:
         run_id: str,
         root_tracker: _RootRunTracker,
         buffer: _RunBufferManager,
+        *,
+        llm_activity_map: dict[str, str] | None = None,
+        llm_trace_map: dict[str, int] | None = None,
     ) -> tuple[LangChainGovernanceEvent | None, bool, bool, str]:
         """Map a LangGraph stream event to a governance event.
 
@@ -1433,7 +1552,11 @@ class OpenBoxLangGraphHandler:
             dur = buffer.duration_ms(event_run_id)
             buf = buffer.get(event_run_id)
             tool_type = self._resolve_tool_type(name, subagent_name)
-            completed_activity_id = f"{event_run_id}-c"
+            # One activity id for the whole tool lifecycle: ActivityCompleted
+            # closes the SAME activity_id ActivityStarted opened. Core keys the
+            # started/completed pair on event_type (not an id suffix), and the
+            # client dedup key includes event type, so both survive distinctly.
+            completed_activity_id = event_run_id
 
             # End OTel span created in on_tool_start and detach context
             if buf is not None and buf.otel_span is not None:
@@ -1502,7 +1625,8 @@ class OpenBoxLangGraphHandler:
             # trace_id, resolved back to the llm_call activity via the base
             # runtime's private trace registry. Only armed when this handler
             # owns a core runtime (never the injected-client lifecycle path).
-            if should_dual_write(self._core_runtime):
+            callback_trace_registered = bool((llm_trace_map or {}).get(event_run_id))
+            if should_dual_write(self._core_runtime) and not callback_trace_registered:
                 parent_ctx = otel_context.get_current()
                 llm_span = _otel_tracer.start_span(
                     "llm.call", context=parent_ctx, kind=otel_trace.SpanKind.INTERNAL,
@@ -1510,6 +1634,7 @@ class OpenBoxLangGraphHandler:
                 token = otel_context.attach(otel_trace.set_span_in_context(llm_span))
                 trace_id = llm_span.get_span_context().trace_id
                 if trace_id:
+                    activity_id = (llm_activity_map or {}).get(event_run_id) or event_run_id
                     # Registered regardless of whether LLMStarted ends up sent
                     # below (empty-prompt subagent-internal LLM calls still get
                     # span-hook governance during the call).
@@ -1520,7 +1645,7 @@ class OpenBoxLangGraphHandler:
                             config=self._config,
                             workflow_id=workflow_id,
                             run_id=run_id,
-                            activity_id=event_run_id,
+                            activity_id=activity_id,
                             activity_type="llm_call",
                             langgraph_node=langgraph_node,
                             langgraph_step=langgraph_step,
