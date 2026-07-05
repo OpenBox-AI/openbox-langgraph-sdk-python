@@ -130,7 +130,9 @@ class LangGraphFrameworkAdapter:
     ) -> NoReturn:
         if ctx is not None:
             self._store.mark_activity_aborted(ctx.workflow_id, ctx.activity_id)
-        identifier = _resolve_identifier(result, ctx)
+        # The identifier here becomes the HITL poll key — must be the bound
+        # activity_id (what the backend matches on), NOT a raw-echoed resource id.
+        identifier = _resolve_approval_activity_id(result, ctx)
         reason = result.reason or "Approval required"
         raise GovernanceBlockedError("require_approval", reason, identifier)
 
@@ -187,17 +189,35 @@ class LangGraphFrameworkAdapter:
 
 
 def _resolve_identifier(result: EvaluationResult, ctx: ActivityContext | None) -> str:
-    """Best-effort resource identifier for the hook-shape error's 3rd arg.
+    """Best-effort resource identifier for a hook-shape BLOCK error's 3rd arg.
 
-    ``EvaluationResult`` carries no URL/file-path field directly (that lives
-    on the wire request the hook already sent, not the Core response this
-    adapter receives) — falls back to the bound activity id so the error
-    still names SOMETHING resolvable in logs, matching the legacy path's
-    ``identifier`` being "whatever the hook call site passed" rather than a
-    server-echoed value.
+    Used for the DISPLAY/log identifier on ``raise_hook_blocked`` — a
+    server-echoed ``result.raw["identifier"]`` (e.g. the offending URL/path)
+    is the meaningful value there and takes precedence; falls back to the bound
+    activity id, then empty.
+
+    NOTE: this is NOT the approval poll key. Approval polling matches on
+    ``activity_id`` (see ``_resolve_approval_activity_id``), so the approval
+    path must not use this raw-first resolution.
     """
     if result.raw.get("identifier"):
         return str(result.raw["identifier"])
     if ctx is not None and ctx.activity_id:
         return ctx.activity_id
+    return ""
+
+
+def _resolve_approval_activity_id(result: EvaluationResult, ctx: ActivityContext | None) -> str:
+    """Poll key for a REQUIRE_APPROVAL raise — the backend matches a pending
+    approval strictly on ``activity_id``, so the bound activity id is the
+    known-correct key and takes precedence. A server-echoed
+    ``result.raw["identifier"]`` may be an unrelated resource/policy id; using
+    it would poll a key the backend never resolves and hang the unbounded
+    poller. Only when no bound activity id exists do we fall back to any echoed
+    identifier, then empty (caller then uses its own synthetic-hook fallback).
+    """
+    if ctx is not None and ctx.activity_id:
+        return ctx.activity_id
+    if result.raw.get("identifier"):
+        return str(result.raw["identifier"])
     return ""

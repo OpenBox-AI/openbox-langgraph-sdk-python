@@ -37,8 +37,10 @@ cd test-agent && uv run python agent.py
 
 The SDK has three governance layers that intercept operations at different levels:
 
-### Layer 1: LangGraph Event Stream (langgraph_handler.py)
-`OpenBoxLangGraphHandler` wraps a compiled LangGraph graph. It processes the v2 event stream (`on_chain_start/end`, `on_tool_start/end`, `on_chat_model_start/end`), sends governance events to OpenBox Core via `GovernanceClient`, and enforces verdicts. This is the main entry point — users call `create_openbox_graph_handler()` (sync function, returns handler immediately) to wrap their graph.
+### Layer 1: Tool/LLM Lifecycle (Producer-Owned via LangChain-Core Callback)
+Tool and LLM lifecycle emission is **owned by the callback layer** (`openbox-langchain-sdk-python`). The `OpenBoxLangChainCoreAsyncCallbackHandler` / `...SyncCallbackHandler` emit lifecycle events (ActivityStarted, ActivityCompleted, LLMStarted, LLMCompleted) directly to OpenBox Core via the `ActivityBridge` ownership channel. This fixes span ordering/correlation bugs: tool hook spans now nest inside the tool's ActivityStarted activity; LLM provider hook spans map into the LLM activity; completions reuse the start activity_id (no more `-c` suffix).
+
+The LangGraph stream-event layer serves as a **fallback for telemetry and span reconstruction** when the callback is not installed (e.g., injected clients or subagent-gated handlers). Completions use stream events for telemetry only — `gate.aevaluate()` polls and continues, never retries the graph. **Sync agents fail-shut on REQUIRE_APPROVAL** (no working sync approval poller).
 
 ### Layer 2: Hook Governance (http/db/file_governance_hooks.py)
 Intercepts low-level operations using built-in instrumentation:

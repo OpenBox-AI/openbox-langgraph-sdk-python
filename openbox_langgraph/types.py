@@ -462,6 +462,58 @@ class GovernanceVerdictResponse:
             raw=dict(result.raw),
         )
 
+    def to_evaluation_result(self) -> EvaluationResult:
+        """Translate this SDK's response shape back into a base-SDK `EvaluationResult`.
+
+        Exact inverse of `from_result` (M18) — needed because the pure-
+        LangChain-Core callback (`openbox_langchain`) takes `EvaluationResult`
+        for its `pre_screen_response` option, while `_pre_screen_input` here
+        only ever produces a `GovernanceVerdictResponse` (every
+        `GovernanceClient.evaluate_event` call, gate-routed or HTTP, returns
+        one — see `client.py`). Field-for-field, same re-parse-through-
+        `Verdict.from_string` rationale as `from_result`: the two `Verdict`
+        enums carry identical string values but are distinct classes.
+
+        Import direction is boundary-legal here (`openbox_langgraph` importing
+        `openbox_core` types) — the reverse (`openbox_langchain` importing
+        `openbox_langgraph` types) is forbidden by the Phase 1 boundary test,
+        which is exactly why this mapper lives on THIS side.
+        """
+        from openbox_core.contracts.results import EvaluationResult
+        from openbox_core.contracts.results import GuardrailsResult as _CoreGuardrailsResult
+        from openbox_core.contracts.results import Verdict as _CoreVerdict
+
+        guardrails: _CoreGuardrailsResult | None = None
+        if gr := self.guardrails_result:
+            guardrails = _CoreGuardrailsResult(
+                redacted_input=gr.redacted_input,
+                input_type=gr.input_type or "activity_input",
+                raw_logs=gr.raw_logs,
+                validation_passed=gr.validation_passed,
+                reasons=[
+                    {"type": r.type, "field": r.field, "reason": r.reason} for r in gr.reasons
+                ],
+            )
+
+        return EvaluationResult(
+            verdict=_CoreVerdict.from_string(self.verdict.value),
+            reason=self.reason,
+            policy_id=self.policy_id,
+            risk_score=self.risk_score,
+            metadata=self.metadata,
+            governance_event_id=self.governance_event_id,
+            guardrails=guardrails,
+            approval_id=self.approval_id,
+            approval_expiration_time=self.approval_expiration_time,
+            trust_tier=self.trust_tier,
+            alignment_score=self.alignment_score,
+            behavioral_violations=self.behavioral_violations,
+            constraints=self.constraints,
+            fallback_used=self.fallback_used,
+            diagnostics=list(self.diagnostics),
+            raw=dict(self.raw),
+        )
+
 
 def parse_governance_response(data: dict[str, Any]) -> GovernanceVerdictResponse:
     """Parse a raw dict from OpenBox Core into a `GovernanceVerdictResponse`."""

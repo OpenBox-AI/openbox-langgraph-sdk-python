@@ -21,15 +21,19 @@ import pytest
 pytest.importorskip("openbox_core")
 
 from langchain_core.messages import HumanMessage
+from openbox_langchain import (
+    ActivityBridge,
+    OpenBoxLangChainCoreAsyncCallbackHandler,
+    OpenBoxLangChainCoreCallbackOptions,
+)
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 
 from openbox_langgraph.client import GovernanceClient
-from openbox_langgraph.core_runtime import create_core_runtime
+from openbox_langgraph.core_runtime import create_core_runtime, get_trace_registry
 from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     OpenBoxLangGraphHandlerOptions,
-    _GuardrailsCallbackHandler,
     _RootRunTracker,
     _RunBufferManager,
 )
@@ -200,24 +204,34 @@ async def test_llm_start_registers_distinct_trace_from_tool(make_handler) -> Non
 
 @pytest.mark.asyncio
 async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_handler) -> None:
-    """The guardrails callback fires before the real chat-model HTTP request.
-    It must register that active OTel trace immediately, because the later
-    LangGraph stream event can arrive too late for started/preflight hooks."""
+    """Phase 5 rebuild (Scope F8): the shared pure-LangChain-Core callback
+    (not the retired `_GuardrailsCallbackHandler`) now owns LLM start/end —
+    it fires before the real chat-model HTTP request and must register the
+    ambient OTel trace immediately, because the later LangGraph stream event
+    (consumer fallback) arrives too late for started/preflight hooks AND
+    must not create a COMPETING trace binding once the callback owns this
+    call (`skip_consumer_side_effects`, C7 extended to LLM).
+
+    Uses the SAME `OpenBoxLangChainCoreAsyncCallbackHandler` + `ActivityBridge`
+    wiring `_governed_config` installs in production (registry-backed
+    `register_trace`/`unregister_trace`, M21) — not a hand-rolled callback."""
     handler = make_handler()
     workflow_id, run_id = "wf-callback-bind", "run-callback-bind"
     callback_run_id = uuid4()
-    llm_activity_map: dict[str, str] = {}
-    llm_trace_map: dict[str, int] = {}
-    cb = _GuardrailsCallbackHandler(
-        client=handler._client,  # type: ignore[attr-defined]
-        config=handler._config,  # type: ignore[attr-defined]
+    bridge = ActivityBridge()
+    handler._activity_bridge = bridge  # type: ignore[attr-defined]
+    registry = get_trace_registry(handler._core_runtime)  # type: ignore[attr-defined]
+    options = OpenBoxLangChainCoreCallbackOptions(
+        runtime=handler._core_runtime,  # type: ignore[attr-defined]
+        bridge=bridge,
         workflow_id=workflow_id,
         run_id=run_id,
-        thread_id="thread-callback-bind",
-        llm_activity_map=llm_activity_map,
-        llm_trace_map=llm_trace_map,
-        core_runtime=handler._core_runtime,  # type: ignore[attr-defined]
+        workflow_type="LangGraphRun",
+        register_trace=registry.register,
+        unregister_trace=registry.unregister,
+        record_less_ok=False,
     )
+    cb = OpenBoxLangChainCoreAsyncCallbackHandler(options)
 
     parent_span = otel_trace.get_tracer("test-pre-llm-callback").start_span("upstream")
     parent_token = otel_context.attach(otel_trace.set_span_in_context(parent_span))
@@ -231,21 +245,25 @@ async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_
         )
 
         event_run_id = str(callback_run_id)
-        assert llm_activity_map[event_run_id] == event_run_id
-        trace_id = llm_trace_map[event_run_id]
-        assert trace_id
-        assert trace_id != parent_trace_id
-        assert otel_trace.get_current_span().get_span_context().trace_id == trace_id
+        # No pre-screen response was injected, so the callback's own
+        # activity_id IS its event_run_id — the H11 alias still registers
+        # (event_run_id == activity_id here), matching `get_by_event_run_id`.
+        record = bridge.get_by_event_run_id(workflow_id, event_run_id)
+        assert record is not None
+        assert record.activity_id == event_run_id
+        assert record.llm_started_sent is True
 
-        core_ctx = handler._core_runtime.context_store.context_for_trace(trace_id)  # type: ignore[union-attr]
+        # The callback registers under whatever trace is AMBIENT at call
+        # time (module docstring of `register_llm_trace`) — no separate span
+        # of its own — so the trace id is the parent's.
+        assert otel_trace.get_current_span().get_span_context().trace_id == parent_trace_id
+
+        core_ctx = handler._core_runtime.context_store.context_for_trace(parent_trace_id)  # type: ignore[union-attr]
         assert core_ctx is not None
         assert core_ctx.workflow_id == workflow_id
         assert core_ctx.run_id == run_id
         assert core_ctx.activity_id == event_run_id
-        assert core_ctx.activity_type == "llm_call"
-        assert core_ctx.activity_input == [{"prompt": "hello"}]
-        assert core_ctx.metadata.get("node") == "agent"
-        assert core_ctx.metadata.get("step") == 7
+        assert core_ctx.activity_type == "ChatOpenAI"
 
         root_tracker, buffer = _RootRunTracker(), _RunBufferManager()
         llm_event = LangGraphStreamEvent(
@@ -257,27 +275,20 @@ async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_
             parent_ids=[],
         )
         await handler._process_event(
-            llm_event,
-            "thread-callback-bind",
-            workflow_id,
-            run_id,
-            root_tracker,
-            buffer,
-            llm_activity_map=llm_activity_map,
-            llm_trace_map=llm_trace_map,
+            llm_event, "thread-callback-bind", workflow_id, run_id, root_tracker, buffer,
         )
         buf = buffer.get(event_run_id)
         assert buf is not None
-        assert buf.llm_started is True
-        assert buf.otel_span is None, "stream fallback must not create a competing LLM span"
-        assert handler._core_runtime.context_store.context_for_trace(trace_id) == core_ctx  # type: ignore[union-attr]
+        # The consumer's own on_chat_model_start still runs (unconditionally,
+        # for buffer bookkeeping) but must not create a COMPETING trace
+        # binding for a callback-owned call.
+        assert buf.otel_span is None, "callback-owned call must not create a competing LLM span"
+        assert handler._core_runtime.context_store.context_for_trace(parent_trace_id) == core_ctx  # type: ignore[union-attr]
 
         await cb.on_llm_end(response=None, run_id=callback_run_id)
-        assert handler._core_runtime.context_store.context_for_trace(trace_id) is None  # type: ignore[union-attr]
-        assert otel_trace.get_current_span().get_span_context().trace_id == parent_trace_id
+        assert handler._core_runtime.context_store.context_for_trace(parent_trace_id) is None  # type: ignore[union-attr]
+        assert bridge.get(workflow_id, event_run_id).llm_completed_sent is True  # type: ignore[union-attr]
     finally:
-        if str(callback_run_id) in llm_trace_map:
-            await cb.on_llm_error(RuntimeError("cleanup"), run_id=callback_run_id)
         otel_context.detach(parent_token)
         parent_span.end()
 

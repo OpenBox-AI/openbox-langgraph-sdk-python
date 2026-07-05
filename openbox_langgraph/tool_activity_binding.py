@@ -57,6 +57,7 @@ from openbox_langgraph.types import safe_serialize
 if TYPE_CHECKING:
     from openbox_core.contracts.context import ActivityContext
     from openbox_core.runtime import OpenBoxRuntime
+    from openbox_langchain import ActivityBridge
 
 __all__ = ["TURN_METADATA_KEY", "bind_tools_activity_scope", "turn_metadata"]
 
@@ -87,6 +88,7 @@ def bind_tools_activity_scope(
     core_runtime: OpenBoxRuntime,
     config: GovernanceConfig,
     resolve_tool_type: Callable[[str], str | None],
+    bridge: ActivityBridge | None = None,
 ) -> None:
     """Compose an OpenBox activity-scope wrapper onto every ``ToolNode`` in ``graph``.
 
@@ -96,6 +98,14 @@ def bind_tools_activity_scope(
 
     Binding closes over THIS runtime's store; a compiled graph should be wrapped
     by ONE handler (see ``langgraph_handler``'s construction note).
+
+    ``bridge`` (C1 — install condition == prepare condition): when not None,
+    both the sync and async wrapper seams call ``bridge.prepare_tool(...)``
+    BEFORE delegating to ``execute(request)``, so the pure-LangChain-Core
+    callback (installed by the handler under the SAME condition) sees a
+    prepared record on its very first ``on_tool_start``. ``bridge=None``
+    (the default) preserves today's behavior exactly — no bridge record is
+    ever created, so the consumer governs every tool event unconditionally.
     """
     store = core_runtime.context_store
     try:
@@ -104,7 +114,7 @@ def bind_tools_activity_scope(
         _logger.debug("tool activity-scope binding skipped: cannot introspect graph (%s)", exc)
         return
     for tool_node in tool_nodes:
-        _bind_tool_node(tool_node, store, config, resolve_tool_type)
+        _bind_tool_node(tool_node, store, config, resolve_tool_type, bridge)
 
 
 def _iter_tool_nodes(graph: Any) -> Any:
@@ -160,6 +170,7 @@ def _prepare_binding(
     request: Any,
     config: GovernanceConfig,
     resolve_tool_type: Callable[[str], str | None],
+    bridge: ActivityBridge | None,
 ) -> tuple[ActivityContext | None, Callable[[], None] | None]:
     """Mint the canonical activity id and build the ``ActivityContext``, or
     ``(None, None)`` when this tool cannot be bound.
@@ -176,6 +187,12 @@ def _prepare_binding(
     ``(None, None)`` means "no governed turn": the caller executes the tool
     UNBOUND (default) or, under ``strict_activity_context``, has already
     raised. Never mints an id it does not also write.
+
+    ``bridge`` (C1): when not None, prepares the bridge record for this
+    canonical activity id BEFORE the caller ever invokes ``execute`` — so the
+    pure-LangChain-Core callback's own ``on_tool_start`` (which fires INSIDE
+    ``execute``, via the ToolNode's Runnable dispatch) finds a record already
+    waiting under the SAME ``(workflow_id, activity_id)`` key it will use.
     """
     tool_call = getattr(request, "tool_call", None) or {}
     name = tool_call.get("name") or "tool"
@@ -194,14 +211,27 @@ def _prepare_binding(
 
     install_run_id()
     args = tool_call.get("args")
+    workflow_id = turn.get("workflow_id", "")
+    activity_id = str(canonical)
+    tool_type = resolve_tool_type(name)
+    if bridge is not None:
+        bridge.prepare_tool(
+            workflow_id,
+            activity_id,
+            tool_name=name,
+            tool_type=tool_type,
+            tool_call_id=tool_call.get("id"),
+            langgraph_node=None,
+            langgraph_step=None,
+        )
     ctx = build_activity_context(
         config=config,
-        workflow_id=turn.get("workflow_id", ""),
+        workflow_id=workflow_id,
         run_id=turn.get("run_id", ""),
-        activity_id=str(canonical),
+        activity_id=activity_id,
         activity_type=name,
         activity_input=safe_serialize(args) if args else None,
-        tool_type=resolve_tool_type(name),
+        tool_type=tool_type,
         tool_name=name,
         tool_call_id=tool_call.get("id"),
     )
@@ -237,6 +267,7 @@ def _bind_tool_node(
     store: Any,
     config: GovernanceConfig,
     resolve_tool_type: Callable[[str], str | None],
+    bridge: ActivityBridge | None,
 ) -> None:
     """Compose OpenBox binding onto a ToolNode's ``_wrap_tool_call`` /
     ``_awrap_tool_call`` seams, preserving any user-provided wrapper.
@@ -254,6 +285,12 @@ def _bind_tool_node(
     ``openbox_sync`` (which composes the user wrapper), exactly as stock
     LangGraph does; the sync wrapper runs inline on the event-loop thread, so
     the ContextVar bind still reaches the tool body.
+
+    ``bridge`` (C2-corrected): BOTH seams prepare the SAME bridge record —
+    ``openbox_sync`` is what makes the sync-only-tool-under-async-graph corner
+    fail-closed PRE-body once the handler also installs the sync core callback
+    (see ``langgraph_handler._governed_config``), because that corner runs
+    ``BaseTool.run``'s sync callback manager, not the async one.
     """
     if getattr(tool_node, _BIND_MARK, False):
         return
@@ -263,7 +300,7 @@ def _bind_tool_node(
     )
 
     def openbox_sync(request: Any, execute: Callable[[Any], Any]) -> Any:
-        ctx, install_run_id = _prepare_binding(request, config, resolve_tool_type)
+        ctx, install_run_id = _prepare_binding(request, config, resolve_tool_type, bridge)
         if ctx is None:
             if existing_sync is not None:
                 return existing_sync(request, execute)
@@ -280,7 +317,7 @@ def _bind_tool_node(
             return reexecute(request)
 
     async def openbox_async(request: Any, execute: Callable[[Any], Awaitable[Any]]) -> Any:
-        ctx, install_run_id = _prepare_binding(request, config, resolve_tool_type)
+        ctx, install_run_id = _prepare_binding(request, config, resolve_tool_type, bridge)
         if ctx is None:
             if existing_async is not None:
                 return await existing_async(request, execute)
