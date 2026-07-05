@@ -44,10 +44,11 @@ Your code                 SDK (3 layers)                              OpenBox Co
 
 governed.ainvoke()
   │
-  ├─ Layer 1: LangGraph Event Stream (langgraph_handler.py)
-  │    on_tool_start/end  ─────────────────────────────────────────→  Policy engine
-  │    on_chat_model_start/end  ───────────────────────────────────→  Guardrails
-  │    on_chain_start/end  ────────────────────────────────────────→  HITL queue
+  ├─ Layer 1: Tool/LLM Lifecycle (openbox-langchain-sdk-python)
+  │    Tool lifecycle via LangChain-Core callback  ────────────────→  Policy engine
+  │    LLM lifecycle via LangChain-Core callback   ───────────────→  Guardrails
+  │    ActivityBridge deduplicates callback events
+  │    Stream events serve as fallback (when callback not installed)
   │         ↑ enforce verdict (allow / block / redact / pause)
   │
   ├─ Layer 2: Hook Governance (http/db/file hooks)
@@ -61,7 +62,7 @@ governed.ainvoke()
        Links hook-level operations to the tool call that triggered them
 ```
 
-**Layer 1** wraps your compiled LangGraph graph and intercepts the [v2 event stream](https://langchain-ai.github.io/langgraph/how-tos/streaming-events-from-within-tools/). It sends governance events (WorkflowStarted, ActivityStarted, etc.) to OpenBox Core and enforces verdicts.
+**Layer 1** tool and LLM lifecycle is **producer-owned** via the LangChain-Core callback (owned by `openbox-langchain-sdk-python`). It sends governance events (ActivityStarted, LLMStarted, etc.) to OpenBox Core and enforces verdicts. The LangGraph event stream serves as a fallback when the callback is not installed (e.g., injected clients or subagent-gated handlers); completions use stream events for telemetry only via `gate.aevaluate` (poll-and-continue, never retry-the-graph).
 
 **Layer 2** uses built-in instrumentation to intercept low-level operations (HTTP requests, DB queries, file I/O) made by your tools. Each operation is evaluated at two stages: `started` (can block) and `completed` (informational).
 

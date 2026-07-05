@@ -18,10 +18,14 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
-from uuid import UUID
 
-from langchain_core.callbacks import AsyncCallbackHandler
-from langchain_core.messages import BaseMessage
+from openbox_langchain import (
+    ActivityBridge,
+    OpenBoxLangChainCoreAsyncCallbackHandler,
+    OpenBoxLangChainCoreCallbackOptions,
+    OpenBoxLangChainCoreSyncCallbackHandler,
+)
+from openbox_langchain.activity_bridge import EventType
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 
@@ -32,7 +36,7 @@ from openbox_langgraph.activity_context_binding import (
     unregister_activity,
 )
 from openbox_langgraph.client import GovernanceClient
-from openbox_langgraph.config import GovernanceConfig, get_global_config, merge_config
+from openbox_langgraph.config import get_global_config, merge_config
 from openbox_langgraph.core_runtime import create_core_runtime, get_trace_registry
 from openbox_langgraph.errors import (
     ApprovalExpiredError,
@@ -80,259 +84,32 @@ def _extract_governance_blocked(exc: Exception) -> GovernanceBlockedError | None
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Guardrails callback handler — pre-LLM interception for PII redaction
-# ═══════════════════════════════════════════════════════════════════
+def _approval_poll_activity_id(hook_err: GovernanceBlockedError, run_id: str) -> str:
+    """Resolve the activity id `ainvoke`'s outer HITL poll should use (C5).
 
-class _GuardrailsCallbackHandler(AsyncCallbackHandler):
-    """LangChain callback handler that intercepts on_chat_model_start BEFORE the
-    LLM call fires, sends a governance LLMStarted event, and mutates the messages
-    in-place with redacted_input from Core.
+    Core matches a pending approval on `(workflow_id, run_id, activity_id)`
+    exactly (`GovernanceClient.poll_approval` / `ApprovalPollParams` — no
+    other identifying field travels in that request), so polling the WRONG
+    activity_id never resolves and `poll_until_decision`'s unbounded `while
+    True` loop hangs forever.
 
-    This mirrors the TypeScript SDK's handleChatModelStart with awaitHandlers=True.
-    Injected into config['callbacks'] so LangGraph propagates it to every LLM node.
+    A REQUIRE_APPROVAL raised by the pure-LangChain-Core tool callback
+    (installed under the C1 condition) carries the tool's REAL activity_id in
+    `.identifier` — set by `LangGraphFrameworkAdapter._raise_pending_approval`
+    from `current_activity_context()`, which resolves correctly here because
+    `run_inline=True` means the callback raises INSIDE the ToolNode's
+    `activity_scope(ctx, store=store)` (see `tool_activity_binding.py`). Use
+    it verbatim so the poll targets the SAME row the tool's ActivityStarted
+    opened — mirroring the pre-existing tool_start/tool_end HITL poll in
+    `_process_event`, which has always polled the tool's own activity_id
+    rather than a synthetic hook id.
+
+    Falls back to the legacy synthetic `f"{run_id}-hook"` id when no
+    identifier is carried (the base-hook — HTTP/DB/file/function preflight —
+    REQUIRE_APPROVAL path this `except` block already handled before this
+    phase; those raises carry no tool activity_id and are unaffected).
     """
-
-    raise_error = True  # Surface GuardrailsValidationError / GovernanceHaltError
-
-    def __init__(
-        self,
-        client: GovernanceClient,
-        config: GovernanceConfig,
-        workflow_id: str,
-        run_id: str,
-        thread_id: str,
-        pre_screen_response: GovernanceVerdictResponse | None = None,
-        pre_screen_activity_id: str | None = None,
-        llm_activity_map: dict[str, str] | None = None,
-        llm_trace_map: dict[str, int] | None = None,
-        core_runtime: Any = None,
-    ) -> None:
-        super().__init__()
-        self._client = client
-        self._config = config
-        self._workflow_id = workflow_id
-        self._run_id = run_id
-        self._thread_id = thread_id
-        self._pre_screen_response = pre_screen_response
-        self._pre_screen_activity_id = pre_screen_activity_id
-        # Shared dict: LangChain callback UUID → activity_id to use for span hook.
-        # Written here, read by _process_event when LLMCompleted fires.
-        self._llm_activity_map: dict[str, str] = (
-            llm_activity_map if llm_activity_map is not None else {}
-        )
-        # Shared dict: LangChain callback UUID -> OTel trace id registered by this
-        # callback before the actual LLM request starts. The stream-event fallback
-        # checks it so it does not install a second, later trace binding.
-        self._llm_trace_map: dict[str, int] = llm_trace_map if llm_trace_map is not None else {}
-        self._llm_trace_handles: dict[str, tuple[Any, Any]] = {}
-        self._core_runtime = core_runtime
-
-    def _start_and_register_llm_trace(
-        self,
-        *,
-        event_run_id: str,
-        activity_id: str,
-        prompt_text: str,
-        metadata: dict[str, Any] | None,
-    ) -> None:
-        """Create/register an active LLM trace before the HTTP request starts.
-
-        When no parent OTel span is already active, httpx would otherwise create
-        the first span itself, with a trace id this callback cannot know in
-        advance. Owning a short-lived parent span here makes that trace id known
-        and registered before base instrumentation sees the started stage.
-        """
-        if not should_dual_write(self._core_runtime):
-            return
-        llm_span = _otel_tracer.start_span(
-            "llm.call",
-            context=otel_context.Context(),
-            kind=otel_trace.SpanKind.INTERNAL,
-        )
-        token = otel_context.attach(otel_trace.set_span_in_context(llm_span))
-        span_ctx = llm_span.get_span_context()
-        trace_id = getattr(span_ctx, "trace_id", None)
-        if not isinstance(trace_id, int) or not trace_id:
-            otel_context.detach(token)
-            llm_span.end()
-            return
-        register_activity(
-            self._core_runtime,
-            trace_id,
-            build_activity_context(
-                config=self._config,
-                workflow_id=self._workflow_id,
-                run_id=self._run_id,
-                activity_id=activity_id,
-                activity_type="llm_call",
-                activity_input=[{"prompt": prompt_text}],
-                langgraph_node=(metadata or {}).get("langgraph_node"),
-                langgraph_step=(metadata or {}).get("langgraph_step"),
-            ),
-        )
-        self._llm_trace_map[event_run_id] = trace_id
-        self._llm_trace_handles[event_run_id] = (llm_span, token)
-
-    def _unregister_llm_trace(self, run_id: UUID | str) -> None:
-        event_run_id = str(run_id)
-        handle = self._llm_trace_handles.pop(event_run_id, None)
-        if handle is not None:
-            span, token = handle
-            otel_context.detach(token)
-            span.end()
-        trace_id = self._llm_trace_map.pop(event_run_id, None)
-        if trace_id and should_dual_write(self._core_runtime):
-            unregister_activity(self._core_runtime, trace_id)
-
-    async def on_chat_model_start(
-        self,
-        serialized: dict[str, Any],
-        messages: list[list[BaseMessage]],
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        if not self._config.send_llm_start_event:
-            return
-
-        # Extract human/user turn text only — mirrors _extract_prompt_from_messages.
-        # Subagent-internal LLM calls have only system/tool messages → empty prompt
-        # → skip guard below prevents sending {"prompt": ""} to Core's guardrail.
-        prompt_parts: list[str] = []
-        for group in messages:
-            for msg in group:
-                role = getattr(msg, "type", None) or getattr(msg, "role", None) or ""
-                if role not in ("human", "user", "generic"):
-                    continue
-                content = msg.content
-                if isinstance(content, str):
-                    prompt_parts.append(content)
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            prompt_parts.append(part.get("text", ""))
-        prompt_text = "\n".join(prompt_parts)
-
-        # Skip governance for LLM calls with no human-turn text (e.g. subagent
-        # internal LLMs that only have system/tool messages). Sending an empty
-        # prompt causes Core's guardrail to return a JSON parse error (block).
-        if not prompt_text.strip():
-            return
-
-        model_name = (
-            serialized.get("name")
-            or (serialized.get("id") or [None])[-1]
-            or "LLM"
-        )
-        event_run_id = str(run_id)
-        activity_id = (
-            self._pre_screen_activity_id
-            if self._pre_screen_response is not None and self._pre_screen_activity_id
-            else event_run_id
-        )
-        self._llm_activity_map[event_run_id] = activity_id
-        self._start_and_register_llm_trace(
-            event_run_id=event_run_id,
-            activity_id=activity_id,
-            prompt_text=prompt_text,
-            metadata=metadata,
-        )
-
-        gov = LangChainGovernanceEvent(
-            source="workflow-telemetry",
-            event_type="LLMStarted",
-            workflow_id=self._workflow_id,
-            run_id=self._run_id,
-            workflow_type=self._config.agent_name or "LangGraphRun",
-            task_queue=self._config.task_queue,
-            timestamp=rfc3339_now(),
-            session_id=self._config.session_id,
-            activity_id=event_run_id,
-            activity_type="llm_call",
-            activity_input=[{"prompt": prompt_text}],
-            llm_model=model_name,
-            prompt=prompt_text,
-        )
-
-        response: GovernanceVerdictResponse | None
-        try:
-            if self._pre_screen_response is not None:
-                # Reuse the pre-screen verdict for PII redaction — the pre-screen already
-                # created an ActivityStarted row (activity_id=run_id+"-pre").  Record that
-                # mapping so _process_event knows to attach the LLM span hook to THAT row
-                # rather than creating a new one with the callback UUID.
-                response = self._pre_screen_response
-                self._pre_screen_response = None
-            else:
-                # No pre-screen (second+ LLM call, or pre-screen disabled) — create a
-                # new row with the callback UUID so the span hook has a row to attach to.
-                response = await self._client.evaluate_event(gov)
-            if response is None:
-                return
-
-            # NOTE: enforce_verdict / HITL are intentionally NOT called here.
-            # LangGraph's graph runner catches callback exceptions even with raise_error=True
-            # and logs them as warnings instead of propagating them to the caller.
-            # Block/halt/guardrail enforcement is done in _pre_screen_input() which runs
-            # directly in ainvoke/astream_governed before the stream starts.
-            #
-            # This callback handler's only job is PII redaction (in-place message mutation).
-
-            # Apply PII redaction: mutate messages in-place before the LLM call fires
-            gr = response.guardrails_result
-            if gr and gr.input_type == "activity_input" and gr.redacted_input is not None:
-                redacted = gr.redacted_input
-                # Core returns [{"prompt": "..."}] — extract the prompt string
-                if isinstance(redacted, list) and redacted:
-                    first = redacted[0]
-                    if isinstance(first, dict):
-                        redacted_text = first.get("prompt")
-                    elif isinstance(first, str):
-                        redacted_text = first
-                    else:
-                        redacted_text = None
-                elif isinstance(redacted, str):
-                    redacted_text = redacted
-                else:
-                    redacted_text = None
-
-                if redacted_text:
-                    # Replace the last human message in each message group
-                    for group in messages:
-                        for j in range(len(group) - 1, -1, -1):
-                            msg = group[j]
-                            if msg.type in ("human", "generic"):
-                                msg.content = redacted_text  # type: ignore[assignment]
-                                break
-        except BaseException:
-            self._unregister_llm_trace(run_id)
-            raise
-
-    async def on_llm_end(
-        self,
-        response: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        self._unregister_llm_trace(run_id)
-
-    async def on_llm_error(
-        self,
-        error: BaseException,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        self._unregister_llm_trace(run_id)
+    return hook_err.identifier or f"{run_id}-hook"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -353,6 +130,17 @@ class _RunBuffer:
     llm_started: bool = False  # True only when LLMStarted was actually sent to Core
     otel_span: Any = None       # OTel span for context propagation across asyncio.Task
     otel_token: Any = None      # OTel context detach token
+    fallback_llm_activity_id: str | None = None
+    """Fallback-path only (no bridge/callback owns this LLM call): the
+    activity_id the consumer's OWN LLMCompleted close must use as its base
+    (before appending ``-c``). Set by ``_map_event``'s ``on_chat_model_start``
+    to the pre-screen's ``"{run_id}-pre"`` id when THIS call is the one that
+    consumed ``_pre_screen_input``'s verdict (call 1) — mirrors the retired
+    ``_GuardrailsCallbackHandler``'s ``llm_activity_map`` for the ONE path
+    that still needs it (injected-client / subagent-gated handlers, where no
+    callback ever claims LLM ownership). ``None`` for every other call, which
+    falls back to ``event_run_id`` (this field's absence == pre-phase-5
+    behavior unchanged)."""
 
 
 class _RunBufferManager:
@@ -413,6 +201,34 @@ class _RootRunTracker:
 
     def reset(self) -> None:
         self._root_run_id = None
+
+
+class _PreScreenClaim:
+    """One-shot claim tracker for the FALLBACK (no bridge/callback) LLM path.
+
+    Fallback-path only: when a callback owns LLM lifecycle (C1, bridge armed)
+    the callback's own `bridge.prepare_llm(..., event_run_id=...)` alias (H11)
+    already resolves which call gets the pre-screen id — this class is never
+    consulted. Without a callback, the consumer's own `on_chat_model_start`
+    (`_map_event`) is the only code that ever sees each LLM call, so IT must
+    decide which one (call 1, and only call 1) claims the pre-screen's
+    `"{run_id}-pre"` activity_id — mirroring the retired
+    `_GuardrailsCallbackHandler`'s per-instance `_pre_screen_response`
+    consume-once field, now scoped to a turn via this object instead of a
+    callback instance.
+    """
+
+    def __init__(self, activity_id: str | None) -> None:
+        self._activity_id = activity_id
+        self._claimed = False
+
+    def claim(self) -> str | None:
+        """Return the pre-screen activity_id exactly once; `None` after (or
+        if there was never a pre-screen response to begin with)."""
+        if self._claimed or self._activity_id is None:
+            return None
+        self._claimed = True
+        return self._activity_id
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -536,6 +352,13 @@ class OpenBoxLangGraphHandler:
         # AttributeError-ing.
         self._span_processor = None
 
+        # Ownership channel for the pure-LangChain-Core callback (C1). Created
+        # ONLY under the exact same condition the callback is installed and the
+        # ToolNode wrapper is told to prepare records — see the `else` branch
+        # below. `None` here means "no callback, no bridge, consumer governs
+        # every tool event unconditionally", matching today's behavior exactly.
+        self._activity_bridge: ActivityBridge | None = None
+
         if opts.client:
             # Injected client (e.g. a test double, or a subclass overriding
             # evaluate_event) is used exactly as given — LIFECYCLE-ONLY: no
@@ -543,7 +366,9 @@ class OpenBoxLangGraphHandler:
             # is the F2 seam: an injected client's OWN evaluate_event override
             # still intercepts every lifecycle governance call the handler
             # makes; hook-level (HTTP/DB/file/function) governance is simply
-            # not active on this path.
+            # not active on this path. No activity bridge either — the
+            # pure-LangChain-Core callback needs a real core runtime's
+            # gate/adapter, which this path deliberately does not build.
             self._client = opts.client
             self._core_runtime = None
         else:
@@ -574,6 +399,20 @@ class OpenBoxLangGraphHandler:
                 agent_private_key=gc.agent_private_key,
                 gate=self._core_runtime.gate,
             )
+            # C1 — install condition == prepare condition: the pure-LangChain-Core
+            # callback (installed per-turn in `_governed_config`) is only ever
+            # armed for a handler with its OWN core runtime AND no subagent-name
+            # resolver. A subagent-gated handler (DeepAgents-style `task` tool
+            # sub-graphs) stays consumer-governed exactly as before — arming a
+            # bridge here without a matching callback installed would have the
+            # wrapper `prepare_tool` records the consumer then treats as "sent"
+            # they never are (the C1 blackout this phase fixes). Only build the
+            # bridge under this SAME condition; otherwise leave it `None` from
+            # `__init__`'s top so `bridge=None` reaches `bind_tools_activity_scope`
+            # and the wrapper never prepares a record.
+            if self._resolve_subagent_name is None:
+                self._activity_bridge = ActivityBridge()
+
             # Bind the base-SDK ActivityContext around ACTUAL tool execution at
             # the ToolNode request seam: mint a canonical activity id, write it
             # to the tool's config["run_id"] so on_tool_start (thus
@@ -589,6 +428,7 @@ class OpenBoxLangGraphHandler:
                     core_runtime=self._core_runtime,
                     config=self._config,
                     resolve_tool_type=lambda name: self._resolve_tool_type(name, None),
+                    bridge=self._activity_bridge,
                 )
 
     # ─────────────────────────────────────────────────────────────
@@ -766,6 +606,9 @@ class OpenBoxLangGraphHandler:
         exactly once per turn regardless of success, mid-stream exception, or
         (for `ainvoke`) an approved hook-approval retry — see the `finally`
         placement in each entry point for why ordering after the retry matters.
+        Stays SYNCHRONOUS (existing tests spy/patch it with a plain callable
+        called without `await`) — the C6 orphan-close below uses the base
+        SDK's SYNC gate for the same reason.
 
         Only sweeps THIS turn's `workflow_id` — never
         `self._core_runtime.context_store.clear()`, which would also drop
@@ -773,10 +616,99 @@ class OpenBoxLangGraphHandler:
         `ainvoke`/`astream*` calls can be in flight together) and the
         runtime's `halt_requested` flag, neither of which is this turn's to
         clear.
+
+        C6/M19 — when this turn armed an `ActivityBridge`, also sweep it:
+        ``sweep_workflow`` drops every bridge record for this workflow and
+        returns them so any ``tool_started_sent and not tool_completed_sent``
+        row (a sibling `asyncio.gather` cancellation leaves no `on_tool_end`/
+        `on_tool_error` to close it — `CancelledError` is a `BaseException`,
+        not caught by the callback's own body) gets a synthetic failed close
+        via the runtime's sync gate. Every record this bridge ever prepared
+        may ALSO carry an abort-mark the callback set via
+        `current_activity_context()` inside the ToolNode-seam `activity_scope`
+        (a ContextVar bind that never goes through
+        `register_activity`/`TraceContextRegistry`, so the trace-only `sweep`
+        above never sees that key) — clear those directly on the runtime's
+        store so they cannot leak for the handler's lifetime.
+
+        The abort-mark clear runs UNCONDITIONALLY for every swept tool record
+        (not gated on `record.abort_marked`): a REQUIRE_APPROVAL raised by the
+        callback can propagate through ANY entry point (`ainvoke` polls and
+        retries it; `astream_governed`/`astream`/`astream_events` have no
+        catch/poll loop at all — pre-existing, HITL retry is `ainvoke`-only —
+        and simply propagate it to the caller), so a per-entry-point catch
+        site is not a reliable place to set the flag. `clear_activity_aborted`
+        is an idempotent set-discard — a no-op for a record that was never
+        actually aborted — so clearing unconditionally is always safe.
+        `record.abort_marked` is still set (see `_mark_bridge_abort`) and
+        checked here as a fast-path/diagnostic signal, not a gate.
         """
         if self._core_runtime is None:
             return
         get_trace_registry(self._core_runtime).sweep(workflow_id)
+        if self._activity_bridge is None:
+            return
+        store = self._core_runtime.context_store
+        for record in self._activity_bridge.sweep_workflow(workflow_id):
+            store.clear_activity_aborted(workflow_id, record.activity_id)
+            if record.tool_started_sent and not record.tool_completed_sent:
+                _logger.info(
+                    "[OpenBox] sweeping orphan callback-started tool activity "
+                    "%s (started, never completed — sibling cancellation?)",
+                    record.activity_id,
+                )
+                self._close_orphan_bridge_tool(workflow_id, record)
+
+    def _mark_bridge_abort(self, workflow_id: str, activity_id: str) -> None:
+        """Record (M19) that the base store's abort mark for `activity_id` was
+        set via the ToolNode-seam ContextVar path, NOT `register_activity` —
+        so `_cleanup_turn`'s `TraceContextRegistry.sweep` (which only clears
+        keys it registered) will never see it, and the mark would otherwise
+        leak on the runtime's `ContextStore` for the handler's lifetime.
+
+        No-op when this turn has no bridge (consumer-governed path — the
+        adapter's OWN abort-mark clearing there is exactly what `sweep`
+        already covers, via `register_activity`'s trace-only dual-write).
+        Safe to call with an activity_id the bridge never prepared (e.g. the
+        legacy synthetic `f"{run_id}-hook"` id from a base-hook approval,
+        C5's fallback branch) — `ActivityBridge.get` returns None and this is
+        a no-op, exactly matching pre-phase-4 behavior for that path.
+        """
+        if self._activity_bridge is None:
+            return
+        record = self._activity_bridge.get(workflow_id, activity_id)
+        if record is not None:
+            record.abort_marked = True
+
+    def _close_orphan_bridge_tool(self, workflow_id: str, record: Any) -> None:
+        """Best-effort failed ActivityCompleted for a swept orphan tool row.
+
+        Uses the runtime's SYNC gate directly (never the async
+        `GovernanceClient`) so `_cleanup_turn` can stay fully synchronous.
+        Strictly telemetry (closing an already-abandoned row) — failures are
+        logged, never raised, so a governance API hiccup during turn cleanup
+        never masks whatever exception (if any) is already propagating
+        through the `finally` this is called from.
+        """
+        from openbox_core.contracts.events import activity_completed
+
+        try:
+            envelope = activity_completed(
+                workflow_id=workflow_id,
+                run_id=workflow_id,
+                workflow_type=self._config.agent_name or "LangGraphRun",
+                activity_id=record.activity_id,
+                activity_type=record.tool_name or "tool",
+                task_queue=self._config.task_queue,
+                error="Activity abandoned (turn cleanup swept an unclosed row)",
+            )
+            self._core_runtime.gate.evaluate(envelope)  # type: ignore[union-attr]
+        except Exception:
+            _logger.warning(
+                "[OpenBox] failed to close orphan bridge tool activity %s",
+                record.activity_id,
+                exc_info=True,
+            )
 
     def _reset_after_approval(self, workflow_id: str) -> None:
         """Clear the abort mark(s) a hook set for this turn BEFORE an approved
@@ -807,12 +739,8 @@ class OpenBoxLangGraphHandler:
         run_id: str,
         thread_id: str,
         pre_screen_response: GovernanceVerdictResponse | None,
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, int]]:
-        """Build the RunnableConfig with this turn's guardrails callback.
-
-        The ``_GuardrailsCallbackHandler`` does pre-LLM PII redaction and owns
-        ``llm_activity_map`` (returned so ``_process_event`` can route the
-        LLMCompleted close to the right activity row).
+    ) -> dict[str, Any]:
+        """Build the RunnableConfig with this turn's core callbacks.
 
         Note: tool-execution ``ActivityContext`` binding is NOT done via a
         callback — LangChain isolates callback context from the tool body, so a
@@ -820,29 +748,86 @@ class OpenBoxLangGraphHandler:
         seam (see ``tool_activity_binding``); this method threads the per-turn
         ids down to those wrappers via ``config["metadata"]`` (a per-invocation
         channel, concurrency-safe — unlike a shared module ContextVar).
+
+        When ``self._activity_bridge`` is armed (C1 — same condition as its
+        construction in ``__init__``), BOTH the async and sync pure-LangChain-Core
+        callbacks (Phase 2, ``openbox_langchain``) are appended to
+        ``cfg["callbacks"]``. The sync handler is what makes the sync-only-tool
+        corner fail-closed PRE-body (C2 — the async handler alone is swallowed
+        there by ``BaseTool.run``'s sync callback manager); installing both lets
+        LangGraph's own cross-dispatch (Phase 0-measured) exercise the
+        evaluate-once/enforce-from-stash contract on every tool call, not just
+        that corner. ``record_less_ok=False`` on both (C8) — this handler's
+        bridge always prepares a record before a governed tool runs, so a
+        record-less callback fire only happens on an unbound nested-subgraph
+        ToolNode, which must NOT send (the consumer, which DOES see that inner
+        event, remains the sole sender).
+
+        Phase 5 — the SAME two callback instances now also own the LLM
+        lifecycle (``send_llm_start_event``/``send_llm_end_event=True``):
+        pre-screen reuse for call 1 (``pre_screen_response`` mapped to the
+        base SDK's ``EvaluationResult``, M18), redaction, trace registration,
+        and the same-id LLMCompleted close (H11). This retires
+        ``_GuardrailsCallbackHandler``'s LLM duties in one atomic cutover — a
+        handler with NO bridge (injected client, or a subagent-gated handler
+        per the C1 blackout above) installs NO LLM-owning callback either,
+        exactly mirroring the pre-existing tool-ownership fallback: the
+        consumer's own ``_pre_screen_input`` (enforcement) and
+        ``_map_event``'s ``on_chat_model_start``/``on_chat_model_end``
+        (telemetry) already cover that path unconditionally and are
+        untouched by this phase — see ``_process_event``'s LLMCompleted
+        fallback branch.
         """
-        llm_activity_map: dict[str, str] = {}
-        llm_trace_map: dict[str, int] = {}
-        guardrails_cb = _GuardrailsCallbackHandler(
-            client=self._client,
-            config=self._config,
-            workflow_id=workflow_id,
-            run_id=run_id,
-            thread_id=thread_id,
-            pre_screen_response=pre_screen_response,
-            pre_screen_activity_id=f"{run_id}-pre" if pre_screen_response is not None else None,
-            llm_activity_map=llm_activity_map,
-            llm_trace_map=llm_trace_map,
-            core_runtime=self._core_runtime,
-        )
+        callbacks: list[Any] = []
+        if self._activity_bridge is not None and self._core_runtime is not None:
+            registry = get_trace_registry(self._core_runtime)
+            callback_options = OpenBoxLangChainCoreCallbackOptions(
+                runtime=self._core_runtime,
+                bridge=self._activity_bridge,
+                workflow_id=workflow_id,
+                run_id=run_id,
+                workflow_type=self._config.agent_name or "LangGraphRun",
+                task_queue=self._config.task_queue,
+                session_id=self._config.session_id,
+                agent_name=self._config.agent_name,
+                send_tool_start_event=self._config.send_tool_start_event,
+                send_tool_end_event=self._config.send_tool_end_event,
+                send_llm_start_event=self._config.send_llm_start_event,
+                send_llm_end_event=self._config.send_llm_end_event,
+                # P3: a bound lambda, not `self._resolve_tool_type(name, None)` —
+                # `name` is out of scope here; the resolver receives only the
+                # tool name argument the callback passes it.
+                tool_type_resolver=lambda n: self._resolve_tool_type(n, None),
+                pre_screen_response=(
+                    pre_screen_response.to_evaluation_result()
+                    if pre_screen_response is not None
+                    else None
+                ),
+                pre_screen_activity_id=(
+                    f"{run_id}-pre" if pre_screen_response is not None else None
+                ),
+                # Registry-backed, not the base SDK's process-wide default
+                # (M21) — the SAME workflow-scoped `TraceContextRegistry` this
+                # handler's tool path and `_cleanup_turn`'s sweep already use,
+                # so a turn-exit sweep also drops LLM trace bindings and an
+                # exact-trace hook lookup resolves via the SAME tier the tool
+                # path relies on. Bound methods, not the raw registry, to
+                # match the `Callable[[int|str, ActivityContext], None]` /
+                # `Callable[[int|str], None]` option shapes exactly.
+                register_trace=registry.register,
+                unregister_trace=registry.unregister,
+                record_less_ok=False,
+            )
+            callbacks.append(OpenBoxLangChainCoreAsyncCallbackHandler(callback_options))
+            callbacks.append(OpenBoxLangChainCoreSyncCallbackHandler(callback_options))
         cfg = dict(config or {})
-        cfg["callbacks"] = [*list(cfg.get("callbacks") or []), guardrails_cb]
+        cfg["callbacks"] = [*list(cfg.get("callbacks") or []), *callbacks]
         # Carry this turn's ids to the wrapped tools via their own RunnableConfig
         # (LangGraph propagates metadata down to each tool). Only when a core
         # runtime owns a store to bind on; merged so user metadata survives.
         if self._core_runtime is not None:
             cfg["metadata"] = {**(cfg.get("metadata") or {}), **turn_metadata(workflow_id, run_id)}
-        return cfg, llm_activity_map, llm_trace_map
+        return cfg
 
     # ─────────────────────────────────────────────────────────────
     # Public invoke / ainvoke
@@ -882,12 +867,16 @@ class OpenBoxLangGraphHandler:
         # Pre-screen: enforce guardrails BEFORE stream starts so exceptions
         # propagate to the caller (LangGraph runner swallows callback exceptions).
         # Returns (workflow_started_sent, pre_screen_response) — response reused
-        # by callback handler for PII redaction to avoid duplicate ActivityStarted.
+        # by the shared core callback for PII redaction (call 1) to avoid a
+        # duplicate ActivityStarted.
         workflow_started_sent, pre_screen_response = await self._pre_screen_input(
             input, workflow_id, run_id
         )
+        pre_screen_claim = _PreScreenClaim(
+            f"{run_id}-pre" if pre_screen_response is not None else None
+        )
 
-        cfg, llm_activity_map, llm_trace_map = self._governed_config(
+        cfg = self._governed_config(
             config,
             workflow_id=workflow_id,
             run_id=run_id,
@@ -903,8 +892,7 @@ class OpenBoxLangGraphHandler:
                 await self._process_event(
                     stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
                     workflow_started_sent=workflow_started_sent,
-                    llm_activity_map=llm_activity_map,
-                    llm_trace_map=llm_trace_map,
+                    pre_screen_claim=pre_screen_claim,
                 )
                 # Capture the root graph's final output from on_chain_end
                 if (
@@ -918,10 +906,16 @@ class OpenBoxLangGraphHandler:
             if hook_err.verdict != "require_approval":
                 raise
             _logger.info("[OpenBox] Hook REQUIRE_APPROVAL during ainvoke, polling")
+            poll_activity_id = _approval_poll_activity_id(hook_err, run_id)
+            self._mark_bridge_abort(workflow_id, poll_activity_id)
             await poll_until_decision(
                 self._client,
-                HITLPollParams(workflow_id=workflow_id, run_id=run_id,
-                               activity_id=f"{run_id}-hook", activity_type="hook"),
+                HITLPollParams(
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    activity_id=poll_activity_id,
+                    activity_type="hook",
+                ),
                 self._config.hitl,
             )
             _logger.info("[OpenBox] Approval granted, retrying ainvoke")
@@ -932,10 +926,16 @@ class OpenBoxLangGraphHandler:
             if hook_err is None or hook_err.verdict != "require_approval":
                 raise
             _logger.info("[OpenBox] Hook REQUIRE_APPROVAL (wrapped) during ainvoke, polling")
+            poll_activity_id = _approval_poll_activity_id(hook_err, run_id)
+            self._mark_bridge_abort(workflow_id, poll_activity_id)
             await poll_until_decision(
                 self._client,
-                HITLPollParams(workflow_id=workflow_id, run_id=run_id,
-                               activity_id=f"{run_id}-hook", activity_type="hook"),
+                HITLPollParams(
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    activity_id=poll_activity_id,
+                    activity_type="hook",
+                ),
                 self._config.hitl,
             )
             _logger.info("[OpenBox] Approval granted, retrying ainvoke")
@@ -977,8 +977,11 @@ class OpenBoxLangGraphHandler:
         workflow_started_sent, pre_screen_response = await self._pre_screen_input(
             input, workflow_id, run_id
         )
+        pre_screen_claim = _PreScreenClaim(
+            f"{run_id}-pre" if pre_screen_response is not None else None
+        )
 
-        cfg, llm_activity_map, llm_trace_map = self._governed_config(
+        cfg = self._governed_config(
             config,
             workflow_id=workflow_id,
             run_id=run_id,
@@ -1000,8 +1003,7 @@ class OpenBoxLangGraphHandler:
                 await self._process_event(
                     stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
                     workflow_started_sent=workflow_started_sent,
-                    llm_activity_map=llm_activity_map,
-                    llm_trace_map=llm_trace_map,
+                    pre_screen_claim=pre_screen_claim,
                 )
                 yield event
         finally:
@@ -1069,8 +1071,11 @@ class OpenBoxLangGraphHandler:
         workflow_started_sent, pre_screen_response = await self._pre_screen_input(
             input, workflow_id, run_id
         )
+        pre_screen_claim = _PreScreenClaim(
+            f"{run_id}-pre" if pre_screen_response is not None else None
+        )
 
-        cfg, llm_activity_map, llm_trace_map = self._governed_config(
+        cfg = self._governed_config(
             config,
             workflow_id=workflow_id,
             run_id=run_id,
@@ -1085,9 +1090,8 @@ class OpenBoxLangGraphHandler:
                 stream_event = LangGraphStreamEvent.from_dict(event)
                 await self._process_event(
                     stream_event, thread_id, workflow_id, run_id, root_tracker, buffer,
+                    pre_screen_claim=pre_screen_claim,
                     workflow_started_sent=workflow_started_sent,
-                    llm_activity_map=llm_activity_map,
-                    llm_trace_map=llm_trace_map,
                 )
                 yield event
         finally:
@@ -1110,15 +1114,152 @@ class OpenBoxLangGraphHandler:
         buffer: _RunBufferManager,
         *,
         workflow_started_sent: bool = False,
-        llm_activity_map: dict[str, str] | None = None,
-        llm_trace_map: dict[str, int] | None = None,
+        pre_screen_claim: _PreScreenClaim | None = None,
     ) -> None:
         """Process a single LangGraph stream event through governance."""
+        # ── C1/C7 — callback ownership, checked BEFORE `_map_event` runs its
+        # side effects (trace registration, span creation). `event.run_id` IS
+        # the canonical activity id for tool events (the ToolNode-seam wrapper
+        # writes it into `config["run_id"]` before `execute()` mints the
+        # LangChain run — see `tool_activity_binding.py`), so it is also
+        # exactly the key the bridge/callback used. Ownership is checked on
+        # SENT flags only (`is_callback_owned`), never record-existence — a
+        # prepared-but-never-started record (e.g. the callback wasn't
+        # installed for this turn, C1 blackout) is NOT owned and falls through
+        # to full consumer governance below, unchanged from pre-phase-4
+        # behavior.
+        #
+        # LLM events (Phase 5) resolve their bridge key via the H11
+        # `event_run_id` alias FIRST: the callback's `on_chat_model_start`
+        # calls `bridge.prepare_llm(..., event_run_id=...)` unconditionally,
+        # so `get_by_event_run_id` finds the record even when the first
+        # call's activity_id diverges from `event.run_id` (the pre-screen
+        # `"{run_id}-pre"` row) — falling through to a direct `event.run_id`
+        # lookup when no alias was ever registered (the callback never ran,
+        # C1 blackout).
+        tool_owned_start = False
+        tool_owned_complete = False
+        llm_owned_start = False
+        llm_owned_complete = False
+        bridge = self._activity_bridge
+        if bridge is not None and event.event in ("on_tool_start", "on_tool_end"):
+            event_type: EventType = (
+                "tool_start" if event.event == "on_tool_start" else "tool_complete"
+            )
+            if bridge.is_callback_owned(workflow_id, event.run_id, event_type):
+                if event_type == "tool_start":
+                    tool_owned_start = True
+                else:
+                    tool_owned_complete = True
+        llm_activity_id = event.run_id
+        if bridge is not None and event.event in ("on_chat_model_start", "on_chat_model_end"):
+            llm_record = bridge.get_by_event_run_id(workflow_id, event.run_id)
+            if llm_record is not None:
+                llm_activity_id = llm_record.activity_id
+            llm_event_type: EventType = (
+                "llm_start" if event.event == "on_chat_model_start" else "llm_complete"
+            )
+            if bridge.is_callback_owned(workflow_id, llm_activity_id, llm_event_type):
+                if llm_event_type == "llm_start":
+                    llm_owned_start = True
+                else:
+                    llm_owned_complete = True
+
         gov_event, is_root, is_start, event_type_label = self._map_event(
             event, thread_id, workflow_id, run_id, root_tracker, buffer,
-            llm_activity_map=llm_activity_map,
-            llm_trace_map=llm_trace_map,
+            skip_consumer_side_effects=(
+                tool_owned_start or tool_owned_complete or llm_owned_start or llm_owned_complete
+            ),
+            pre_screen_claim=pre_screen_claim,
         )
+
+        # ── Callback-owned ToolCompleted (P1): the callback already SENT
+        # ActivityCompleted (telemetry-only, C4 — gate.aevaluate, never
+        # adapter-enforcing) and stashed the verdict on the bridge record.
+        # Read it back and drive the SAME enforce + poll-and-continue the
+        # consumer runs today for an unowned ToolCompleted, so a callback-owned
+        # BLOCK/HALT/REQUIRE_APPROVAL is never silently downgraded to
+        # telemetry-only. Never re-SEND (the callback already did).
+        if tool_owned_complete:
+            record = bridge.get(workflow_id, event.run_id) if bridge is not None else None
+            stashed = record.completion_result if record is not None else None
+            if stashed is not None:
+                # Named distinctly from `response` below — mypy infers a
+                # single type for a repeated variable name across a whole
+                # function body, and `response` elsewhere in this method is
+                # `GovernanceVerdictResponse | None` (evaluate_event's return
+                # type), while `.from_result` always returns non-Optional.
+                stashed_response = GovernanceVerdictResponse.from_result(stashed)
+                context = lang_graph_event_to_context(event.event, is_root=is_root)
+                result = enforce_verdict(stashed_response, context)
+                if result.requires_hitl:
+                    try:
+                        await poll_until_decision(
+                            self._client,
+                            HITLPollParams(
+                                workflow_id=workflow_id,
+                                run_id=run_id,
+                                activity_id=event.run_id,
+                                activity_type=(gov_event.activity_type if gov_event else None)
+                                or event.name,
+                            ),
+                            self._config.hitl,
+                        )
+                    except (ApprovalRejectedError, ApprovalExpiredError, ApprovalTimeoutError) as e:
+                        raise GovernanceHaltError(str(e)) from e
+            return
+
+        # Callback-owned ToolStarted: the callback already sent+enforced this
+        # (a stop-shaped/REQUIRE_APPROVAL verdict would have raised out of the
+        # callback itself, before this event was ever produced) — nothing left
+        # for the consumer to send or enforce.
+        if tool_owned_start:
+            return
+
+        # ── Callback-owned LLMCompleted (Phase 5, mirrors tool_owned_complete
+        # above): the callback already sent ActivityCompleted (gate.aevaluate
+        # only, C4 — never adapter-enforcing) on the SAME id as its
+        # LLMStarted, and stashed the verdict on the bridge record keyed by
+        # THAT id (`llm_activity_id`, resolved via the H11 alias above — NOT
+        # `event.run_id` for a pre-screened first call). Checked BEFORE the
+        # `gov_event is None` guard below: the consumer's OWN `_map_event`
+        # empty-prompt skip (M14) returns `None` independent of callback
+        # ownership, but the callback (M14-documented: sends even an empty
+        # prompt) still governed this call and may have stashed a
+        # REQUIRE_APPROVAL/BLOCK/HALT verdict that must not be silently
+        # dropped just because the consumer's own mapping had nothing to add.
+        # Enforce from the stash so a BLOCK/HALT/REQUIRE_APPROVAL is never
+        # silently downgraded to telemetry-only; never re-SEND.
+        if llm_owned_complete:
+            record = bridge.get(workflow_id, llm_activity_id) if bridge is not None else None
+            stashed = record.completion_result if record is not None else None
+            if stashed is not None:
+                stashed_response = GovernanceVerdictResponse.from_result(stashed)
+                context = lang_graph_event_to_context(event.event, is_root=is_root)
+                result = enforce_verdict(stashed_response, context)
+                if result.requires_hitl:
+                    try:
+                        await poll_until_decision(
+                            self._client,
+                            HITLPollParams(
+                                workflow_id=workflow_id,
+                                run_id=run_id,
+                                activity_id=llm_activity_id,
+                                activity_type=(gov_event.activity_type if gov_event else None)
+                                or "llm_call",
+                            ),
+                            self._config.hitl,
+                        )
+                    except (ApprovalRejectedError, ApprovalExpiredError, ApprovalTimeoutError) as e:
+                        raise GovernanceHaltError(str(e)) from e
+            return
+
+        # Callback-owned LLMStarted: the callback already sent this (pre-screen
+        # reuse or a real evaluate) — nothing left for the consumer to send.
+        # Same "checked before gov_event is None" rationale as above.
+        if llm_owned_start:
+            return
+
         if gov_event is None:
             return
 
@@ -1133,29 +1274,48 @@ class OpenBoxLangGraphHandler:
                 return
             if event_type_label == "LLMStarted" and not self._config.send_llm_start_event:
                 return
-            # _GuardrailsCallbackHandler owns LLMStarted — it fires pre-LLM with redaction.
-            # Skip re-sending here to avoid duplicate governance events.
+            # ── LLMStarted FALLBACK (Phase 5, M13 non-goal preserved): reached
+            # only when no callback owns this LLM call's start (injected
+            # client, subagent-gated handler, callback disabled). Mirrors the
+            # retired `_GuardrailsCallbackHandler.on_chat_model_start` EXACTLY:
+            # call 1 (this run claimed the pre-screen's `-pre` activity_id via
+            # `_PreScreenClaim` — checked on the buffer, NOT `gov_event
+            # .activity_id`, which is always the raw `event_run_id` for a
+            # START event regardless of the claim) was ALREADY sent and
+            # enforced by `_pre_screen_input` before the stream started — skip
+            # it here to avoid a duplicate ActivityStarted. Call 2+ (no claim)
+            # is SENT here as telemetry (a real `evaluate_event` call, so Core
+            # still gets a row for it) but deliberately NEVER enforced
+            # (`enforce_verdict`/HITL are skipped) — 2nd+ prompts stay
+            # UNENFORCED by design (M13, documented Non-Goal, not closed by
+            # this phase; the retired class had this exact comment: "LangGraph's
+            # graph runner catches callback exceptions... enforcement is done
+            # in _pre_screen_input()").
             if event_type_label == "LLMStarted":
+                buf = buffer.get(event.run_id)
+                claimed_pre_screen = buf is not None and buf.fallback_llm_activity_id is not None
+                if not claimed_pre_screen:
+                    await self._client.evaluate_event(gov_event)
                 return
         else:
             if event_type_label == "ChainCompleted" and not self._config.send_chain_end_event:
                 return
             if event_type_label == "ToolCompleted" and not self._config.send_tool_end_event:
                 return
-            # Skip LLMCompleted governance event — no ActivityCompleted sent for LLM
-            # calls (mirrors Temporal SDK). Fire the LLM span hook instead, routed to
-            # the correct existing row so no orphan rows are created.
+            # ── LLMCompleted FALLBACK (Phase 5): reached only when no callback
+            # owns this LLM call's completion — injected-client handlers (no
+            # core runtime), a subagent-gated handler (no bridge, C1
+            # blackout), or the callback simply disabled. Mirrors the
+            # pre-phase-5 consumer close exactly, on the SAME id
+            # `_map_event`'s `on_chat_model_start` returned as this event's
+            # `activity_id` — the `-pre` row for call 1 (via `_PreScreenClaim`,
+            # the fallback-path replacement for the retired
+            # `_GuardrailsCallbackHandler`'s `llm_activity_map`), or the raw
+            # `event_run_id` for every later call on this handler.
             if event_type_label == "LLMCompleted":
                 if self._config.send_llm_start_event and gov_event.activity_id:
-                    # Resolve activity_id for the LLM row (pre-screen or callback-UUID)
-                    llm_activity_id = (
-                        (llm_activity_map or {}).get(gov_event.activity_id)
-                        or gov_event.activity_id
-                    )
                     llm_activity_type = gov_event.activity_type or "llm_call"
-
-                    # Close the LLM row in Core with ActivityCompleted
-                    completed_activity_id = f"{llm_activity_id}-c"
+                    completed_activity_id = f"{gov_event.activity_id}-c"
                     completed_event = LangChainGovernanceEvent(
                         source="workflow-telemetry",
                         event_type="LLMCompleted",
@@ -1290,10 +1450,29 @@ class OpenBoxLangGraphHandler:
         root_tracker: _RootRunTracker,
         buffer: _RunBufferManager,
         *,
-        llm_activity_map: dict[str, str] | None = None,
-        llm_trace_map: dict[str, int] | None = None,
+        skip_consumer_side_effects: bool = False,
+        pre_screen_claim: _PreScreenClaim | None = None,
     ) -> tuple[LangChainGovernanceEvent | None, bool, bool, str]:
         """Map a LangGraph stream event to a governance event.
+
+        ``skip_consumer_side_effects`` (C7, extended to LLM events in Phase
+        5): True for a callback-owned `on_tool_start`/`on_tool_end` OR
+        `on_chat_model_start`/`on_chat_model_end` event. Skips the OTel span
+        creation/teardown and `register_activity`/`unregister_activity`
+        trace-only dual-write — consumer-only bookkeeping that exists so the
+        base hook runtime can resolve an activity via the EXACT trace-id
+        tier. It is redundant (and would be WRONG to duplicate) for a
+        callback-owned tool/LLM call: the callback runs `run_inline=True`
+        (tools: INSIDE the ToolNode-seam's OWN `activity_scope`; LLM calls:
+        registers its OWN trace via the injected `register_trace` callable
+        BEFORE the provider HTTP call) — a SECOND, later-registered OTel
+        span/trace binding from this method would only be pure overhead and,
+        for LLM calls, would also disagree with the callback's activity_id
+        (the pre-screen `-pre` id for call 1) on which trace maps to which
+        activity. The `_RunBufferManager` registration/duration/removal
+        bookkeeping is NEVER skipped — the governance event this method
+        still returns (when not `None`) and the buffer's `duration_ms`
+        calculation are used unconditionally.
 
         Returns:
             A 4-tuple of (governance_event | None, is_root, is_start, event_type_label).
@@ -1485,7 +1664,9 @@ class OpenBoxLangGraphHandler:
             # the correct trace_id, which the base runtime resolves back to this activity
             # via its private TraceContextRegistry (the dual-write below). Only armed when
             # this handler owns a core runtime (never the injected-client lifecycle path).
-            if should_dual_write(self._core_runtime):
+            # Skipped entirely for a callback-owned tool (C7) — its ToolNode-seam
+            # `activity_scope` already provides ContextVar-tier resolution.
+            if should_dual_write(self._core_runtime) and not skip_consumer_side_effects:
                 parent_ctx = otel_context.get_current()
                 tool_span = _otel_tracer.start_span(
                     f"tool.{name}", context=parent_ctx, kind=otel_trace.SpanKind.INTERNAL,
@@ -1624,9 +1805,16 @@ class OpenBoxLangGraphHandler:
             # boundaries so base-instrumentation child spans inherit this
             # trace_id, resolved back to the llm_call activity via the base
             # runtime's private trace registry. Only armed when this handler
-            # owns a core runtime (never the injected-client lifecycle path).
-            callback_trace_registered = bool((llm_trace_map or {}).get(event_run_id))
-            if should_dual_write(self._core_runtime) and not callback_trace_registered:
+            # owns a core runtime (never the injected-client lifecycle path)
+            # AND the call is NOT callback-owned (Phase 5, C7 extended to
+            # LLM) — a callback-owned call already registered ITS OWN trace
+            # via the injected `register_trace` callable (same registry) in
+            # `on_chat_model_start`, keyed by the callback's activity_id
+            # (the pre-screen `-pre` id for call 1, not necessarily
+            # `event_run_id`). A second, later registration here would either
+            # be pure overhead or — worse — bind the SAME trace id to the
+            # WRONG activity_id for call 1.
+            if should_dual_write(self._core_runtime) and not skip_consumer_side_effects:
                 parent_ctx = otel_context.get_current()
                 llm_span = _otel_tracer.start_span(
                     "llm.call", context=parent_ctx, kind=otel_trace.SpanKind.INTERNAL,
@@ -1634,7 +1822,6 @@ class OpenBoxLangGraphHandler:
                 token = otel_context.attach(otel_trace.set_span_in_context(llm_span))
                 trace_id = llm_span.get_span_context().trace_id
                 if trace_id:
-                    activity_id = (llm_activity_map or {}).get(event_run_id) or event_run_id
                     # Registered regardless of whether LLMStarted ends up sent
                     # below (empty-prompt subagent-internal LLM calls still get
                     # span-hook governance during the call).
@@ -1645,7 +1832,7 @@ class OpenBoxLangGraphHandler:
                             config=self._config,
                             workflow_id=workflow_id,
                             run_id=run_id,
-                            activity_id=activity_id,
+                            activity_id=event_run_id,
                             activity_type="llm_call",
                             langgraph_node=langgraph_node,
                             langgraph_step=langgraph_step,
@@ -1671,6 +1858,15 @@ class OpenBoxLangGraphHandler:
             buf = buffer.get(event_run_id)
             if buf is not None:
                 buf.llm_started = True
+                # Fallback-path pre-screen claim (no callback owns this call —
+                # see `_PreScreenClaim`'s docstring): the FIRST non-empty-prompt
+                # LLM call in the turn claims the pre-screen's `"{run_id}-pre"`
+                # id as ITS fallback completion base, mirroring the retired
+                # `_GuardrailsCallbackHandler`'s `llm_activity_map`. A no-op
+                # (returns None) when no pre-screen response exists, or it was
+                # already claimed by an earlier call this turn.
+                if pre_screen_claim is not None:
+                    buf.fallback_llm_activity_id = pre_screen_claim.claim()
             model_name = _extract_model_name_from_event(event) or name
             gov = LangChainGovernanceEvent(
                 source="workflow-telemetry",
@@ -1695,8 +1891,21 @@ class OpenBoxLangGraphHandler:
             dur = buffer.duration_ms(event_run_id)
             buf = buffer.get(event_run_id)
             llm_started = buf.llm_started if buf else False
+            # Fallback-path pre-screen claim (see `on_chat_model_start` above
+            # and `_PreScreenClaim`'s docstring): call 1's completion base id
+            # is the `-pre` row it claimed, not its own `event_run_id` — this
+            # is what lets the fallback close below land on the SAME row
+            # `_pre_screen_input` opened, matching pre-phase-5 behavior.
+            fallback_activity_id = (
+                buf.fallback_llm_activity_id if buf is not None else None
+            ) or event_run_id
 
-            # End OTel span created in on_chat_model_start and detach context
+            # End OTel span created in on_chat_model_start and detach context.
+            # A callback-owned call never had a span created above (skipped by
+            # `skip_consumer_side_effects`), so `buf.otel_span` is None there
+            # and this whole block is a no-op — the callback's OWN
+            # `unregister_trace` call (`on_llm_end`/`on_llm_error`) is what
+            # unregisters ITS trace binding, on ITS activity_id.
             if buf is not None and buf.otel_span is not None:
                 llm_trace_id = buf.otel_span.get_span_context().trace_id
                 if buf.otel_token is not None:
@@ -1727,7 +1936,7 @@ class OpenBoxLangGraphHandler:
             # "every activity started … not the LLM prompt should have a span call"
             # LLM events are explicitly excluded from the span requirement.
             # Additionally, the LLMStarted activity_id (from _pre_screen_input or
-            # _GuardrailsCallbackHandler) doesn't reliably match event.run_id here,
+            # the shared core callback) doesn't reliably match event.run_id here,
             # so a span hook would create an orphan governance event (duplicate).
             gov = LangChainGovernanceEvent(
                 source="workflow-telemetry",
@@ -1738,7 +1947,7 @@ class OpenBoxLangGraphHandler:
                 task_queue=self._config.task_queue,
                 timestamp=rfc3339_now(),
                 session_id=self._config.session_id,
-                activity_id=event_run_id,
+                activity_id=fallback_activity_id,
                 activity_output=safe_serialize(llm_output),
                 status="completed",
                 duration_ms=dur,

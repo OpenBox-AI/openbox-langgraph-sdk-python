@@ -11,6 +11,7 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "openbox-sdk-python>=0.1.0",
+    "openbox-langchain-sdk-python>=0.1.0",
     "cryptography>=42.0.0",
     "httpx>=0.27.0",
     "langchain-core>=1.3.3",
@@ -53,12 +54,22 @@ dev = [
 # Base SDK has no published release yet; develop against the sibling checkout.
 # Phase-independent: swapped for a published constraint at release time.
 openbox-sdk-python = { path = "../openbox-sdk-python", editable = true }
+# Pure LangChain-Core callback adapter (base package only — no `[agent]`
+# extra, which pulls in `langchain` and this repo has no need of it). Develop
+# against the sibling checkout until it has a published release; both repos
+# pin the SAME editable ../openbox-sdk-python base dep above.
+openbox-langchain-sdk-python = { path = "../openbox-langchain-sdk-python", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["openbox_langgraph"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# importlib mode isolates test-module resolution from sys.path. Required once
+# the editable openbox-langchain-sdk-python sibling is installed: its own
+# top-level `tests` package would otherwise shadow this repo's un-packaged
+# `tests/` dir (e.g. `tests.golden`) and break collection under prepend mode.
+addopts = "--import-mode=importlib"
 
 [tool.coverage.run]
 omit = [
@@ -79,3 +90,13 @@ select = ["E", "F", "I", "UP", "B", "C4", "PIE", "RUF"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+# openbox_langchain ships no py.typed marker yet — sibling dependency
+# consumed as an editable path, not a type-stub gap in THIS repo's own code.
+# `ignore_missing_imports` alone does not suppress mypy's `import-untyped`
+# code for an editable install with no py.typed marker (only `import-not-found`) —
+# `disable_error_code` is required to actually silence it here.
+module = ["openbox_langchain", "openbox_langchain.*"]
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]

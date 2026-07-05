@@ -164,6 +164,35 @@ class TestApprovalIsRaiseOnly:
                 EvaluationResult(verdict=Verdict.REQUIRE_APPROVAL, reason="x")
             )
 
+    async def test_approval_poll_key_ignores_server_echoed_identifier(self) -> None:
+        """C5 hang guard: the approval identifier is the HITL POLL KEY, and Core
+        matches a pending approval on activity_id. Even if a Core response echoes
+        an unrelated `identifier` (a policy/resource id), the raise must carry the
+        bound activity_id — polling the echoed value would target a key Core never
+        resolves and hang the unbounded poller. (Unlike raise_hook_blocked, whose
+        DISPLAY identifier legitimately prefers the echoed value.)"""
+        adapter, _ = _bound_adapter()
+        result = EvaluationResult(
+            verdict=Verdict.REQUIRE_APPROVAL,
+            reason="needs sign-off",
+            raw={"identifier": "policy-42-not-an-activity-id"},
+        )
+        with pytest.raises(GovernanceBlockedError) as exc_info:
+            await adapter.handle_approval(result)
+        assert exc_info.value.identifier == _CTX.activity_id
+
+    def test_sync_approval_poll_key_ignores_server_echoed_identifier(self) -> None:
+        """Sync counterpart of the C5 approval poll-key guard."""
+        adapter, _ = _bound_adapter()
+        result = EvaluationResult(
+            verdict=Verdict.REQUIRE_APPROVAL,
+            reason="needs sign-off",
+            raw={"identifier": "policy-42-not-an-activity-id"},
+        )
+        with pytest.raises(GovernanceBlockedError) as exc_info:
+            adapter.handle_approval_sync(result)
+        assert exc_info.value.identifier == _CTX.activity_id
+
 
 # ── on_completed_hook_result ─────────────────────────────────────────────────
 

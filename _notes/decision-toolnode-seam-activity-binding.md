@@ -88,9 +88,14 @@ which is exactly what lets us write it.
 
 `config.strict_activity_context=True` raises `OpenBoxConfigError` before running
 a tool that can't be bound (no governed-turn metadata). Sharp edge: the raise is
-thrown inside the `ToolNode` call, so a ToolNode with the default
-`handle_tool_errors=True` turns it into an error `ToolMessage` (visible, tool
-still not run) rather than propagating — use `handle_tool_errors=False` to
-hard-fail. Default (`False`) logs once and runs unbound.
+thrown inside the `ToolNode` call, so its `handle_tool_errors` setting decides
+whether it propagates. **Version note (verified 2026-07-05 against installed
+langgraph / langchain-core 1.4.0):** the CURRENT default is
+`_default_handle_tool_errors`, which converts only `ToolInvocationError` to an
+error `ToolMessage` and RE-RAISES everything else — so `OpenBoxConfigError` (and
+governance errors raised from `on_tool_start`) propagate by default now. Only a
+user-configured catch-all (`handle_tool_errors=True`, a string, or a broad
+callable/tuple) still swallows them into a `ToolMessage` (tool still not run).
+Default config (`strict_activity_context=False`) logs once and runs unbound.
 
 Related: [[decision-base-only-hook-runtime]]
