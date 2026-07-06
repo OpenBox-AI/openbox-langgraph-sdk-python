@@ -34,7 +34,8 @@ from openbox_langgraph.types import (
 if TYPE_CHECKING:
     from openbox_core.gate import GovernanceGate
 
-_SDK_VERSION = "0.3.0"
+_SDK_PACKAGE_VERSION = "0.3.0"
+_SDK_IDENTIFIER = f"openbox-langgraph-python-v{_SDK_PACKAGE_VERSION}"
 
 
 def _network_fallback_result(on_api_error: str, msg: str) -> GovernanceVerdictResponse | None:
@@ -148,8 +149,8 @@ def build_auth_headers(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": f"OpenBox-LangGraph-SDK/{_SDK_VERSION}",
-        "X-OpenBox-SDK-Version": _SDK_VERSION,
+        "User-Agent": f"OpenBox-LangGraph-SDK/{_SDK_IDENTIFIER}",
+        "X-OpenBox-SDK-Version": _SDK_IDENTIFIER,
     }
     if agent_identity:
         if method is None or pathname is None:
