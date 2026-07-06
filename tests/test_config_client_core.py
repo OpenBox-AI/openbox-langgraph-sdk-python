@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
+import openbox_langgraph
 from openbox_langgraph import config as config_module
 from openbox_langgraph.client import ApprovalPollParams, GovernanceClient, build_auth_headers
 from openbox_langgraph.errors import (
@@ -154,8 +155,9 @@ def test_build_auth_headers_masks_no_values_and_sets_sdk_headers() -> None:
 
     assert headers["Authorization"] == "Bearer obx_test_key"
     assert headers["Content-Type"] == "application/json"
-    assert headers["User-Agent"].startswith("OpenBox-LangGraph-SDK/")
-    assert headers["X-OpenBox-SDK-Version"]
+    sdk_identifier = f"openbox-langgraph-python-v{openbox_langgraph.__version__.removeprefix('v')}"
+    assert headers["User-Agent"] == f"OpenBox-LangGraph-SDK/{sdk_identifier}"
+    assert headers["X-OpenBox-SDK-Version"] == sdk_identifier
 
 
 async def test_validate_api_key_success_and_auth_failure() -> None:

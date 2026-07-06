@@ -51,6 +51,9 @@ from openbox_langgraph.trace_context_registry import (
 # SDK-specific env namespace. Resolution order is explicit > OPENBOX_LANGGRAPH_*
 # > OPENBOX_* > defaults (handled by OpenBoxConfig.resolve).
 CORE_ENV_PREFIX = "OPENBOX_LANGGRAPH"
+SDK_ENGINE = "langgraph"
+SDK_LANGUAGE = "python"
+SDK_PACKAGE_VERSION = "0.3.0"
 
 __all__ = [
     "CORE_ENV_PREFIX",
@@ -121,6 +124,9 @@ def create_core_runtime(
         agent_name=config.agent_name,
         agent_did=agent_did,
         agent_private_key=agent_private_key,
+        sdk_version=SDK_PACKAGE_VERSION,
+        sdk_engine=SDK_ENGINE,
+        sdk_language=SDK_LANGUAGE,
         validate=True,
     )
 
