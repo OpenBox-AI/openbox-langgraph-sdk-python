@@ -34,7 +34,7 @@ from openbox_langgraph.types import (
 if TYPE_CHECKING:
     from openbox_core.gate import GovernanceGate
 
-_SDK_PACKAGE_VERSION = "0.3.0"
+_SDK_PACKAGE_VERSION = "1.0.0"
 _SDK_IDENTIFIER = f"openbox-langgraph-python-v{_SDK_PACKAGE_VERSION}"
 
 
