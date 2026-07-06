@@ -1,0 +1,31 @@
+[project]
+name = "demo_04_content_builder_langgraph"
+version = "0.1.0"
+description = "OpenBox-governed content-builder agent with one LangGraph prebuilt ReAct agent"
+authors = [{ name = "OpenBox Team", email = "tony@openbox.ai" }]
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain-core>=1.3.3",
+    "langchain-openai>=0.3.0",
+    "python-dotenv>=1.0.1",
+    "pyyaml>=6.0",
+    "tavily-python>=0.5.0",
+    "google-genai>=1.0.0",
+    "pillow>=10.0.0",
+    "rich>=13.0.0",
+    "openbox-langgraph-sdk-python",
+]
+
+[project.scripts]
+demo_04_content_builder_langgraph = "demo_04_content_builder_langgraph.main:run"
+
+[tool.uv.sources]
+openbox-langgraph-sdk-python = { path = "../..", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo_04_content_builder_langgraph"]
