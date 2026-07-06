@@ -1,10 +1,7 @@
-# openbox/span_processor.py
-"""
-OpenTelemetry SpanProcessor for workflow governance.
+"""Compatibility span processor for workflow governance.
 
-WorkflowSpanProcessor manages activity context, trace mappings, and governance
-state (verdicts, abort/halt flags) for hook-level governance. Forwards spans
-to fallback exporters (Jaeger, OTLP, etc.) without buffering.
+The active hook governance path now lives in ``openbox_core``. This processor
+remains for callers that import the historical LangGraph SDK surface directly.
 """
 
 import logging

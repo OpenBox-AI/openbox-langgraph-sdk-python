@@ -79,8 +79,7 @@ def traced(
     """
     Decorator to trace function calls as OpenTelemetry spans.
 
-    The spans will be captured by WorkflowSpanProcessor and included
-    in ActivityCompleted governance events.
+    Hook governance is owned by the shared base SDK instrumentation.
 
     Args:
         name: Custom span name. Defaults to function name.

@@ -1,29 +1,38 @@
-"""OpenBox AIP agent identity signing helpers."""
+"""OpenBox AIP agent identity signing helpers.
+
+The LangGraph SDK keeps this module as its compatibility surface, while the
+shared base SDK owns DID validation, canonical request construction, and
+Ed25519 signing.
+"""
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from openbox_core.errors import OpenBoxConfigError as CoreOpenBoxConfigError
+from openbox_core.identity import (
+    HEADER_BODY_SHA256,
+    HEADER_DID,
+    HEADER_NONCE,
+    HEADER_SIGNATURE,
+    HEADER_TIMESTAMP,
+    AgentIdentity,
+    build_canonical_string,
+    load_ed25519_seed,
+    validate_agent_did,
+)
 
 from openbox_langgraph.errors import OpenBoxConfigError
 
-OPENBOX_AGENT_DID_HEADER = "X-OpenBox-Agent-DID"
-OPENBOX_AGENT_TIMESTAMP_HEADER = "X-OpenBox-Agent-Timestamp"
-OPENBOX_AGENT_NONCE_HEADER = "X-OpenBox-Agent-Nonce"
-OPENBOX_BODY_SHA256_HEADER = "X-OpenBox-Body-SHA256"
-OPENBOX_AGENT_SIGNATURE_HEADER = "X-OpenBox-Agent-Signature"
-
-_DID_PATTERN = re.compile(
-    r"^did:aip:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-_ED25519_SEED_BYTE_LENGTH = 32
+OPENBOX_AGENT_DID_HEADER = HEADER_DID
+OPENBOX_AGENT_TIMESTAMP_HEADER = HEADER_TIMESTAMP
+OPENBOX_AGENT_NONCE_HEADER = HEADER_NONCE
+OPENBOX_BODY_SHA256_HEADER = HEADER_BODY_SHA256
+OPENBOX_AGENT_SIGNATURE_HEADER = HEADER_SIGNATURE
 
 
 @dataclass(frozen=True)
@@ -46,7 +55,7 @@ def build_agent_identity_canonical_request(
     timestamp: str,
 ) -> str:
     """Return Core's newline-joined canonical request string."""
-    return "\n".join([method.upper(), pathname, timestamp, nonce, body_sha256])
+    return build_canonical_string(method, pathname, timestamp, nonce, body_sha256)
 
 
 def validate_agent_identity_config(*, did: str, private_key: str) -> AgentIdentityConfig:
@@ -54,9 +63,11 @@ def validate_agent_identity_config(*, did: str, private_key: str) -> AgentIdenti
     normalized_did = did.strip()
     normalized_private_key = private_key.strip()
 
-    if not _DID_PATTERN.match(normalized_did):
+    try:
+        validate_agent_did(normalized_did)
+    except CoreOpenBoxConfigError as exc:
         msg = "Invalid OpenBox agent DID. Expected format 'did:aip:<uuid>'."
-        raise OpenBoxConfigError(msg)
+        raise OpenBoxConfigError(msg) from exc
 
     private_key_seed = _decode_private_key_seed(normalized_private_key)
     return AgentIdentityConfig(
@@ -110,31 +121,30 @@ def create_agent_identity_headers(
         nonce=nonce_value,
         body_sha256=body_sha256,
     )
-    signing_key = Ed25519PrivateKey.from_private_bytes(
-        _decode_private_key_seed(identity.private_key)
-    )
-    signature = signing_key.sign(canonical.encode("utf-8"))
+    try:
+        signing_identity = AgentIdentity.from_private_key(identity.did, identity.private_key)
+    except CoreOpenBoxConfigError as exc:  # pragma: no cover - validation above guards this
+        msg = "Invalid OpenBox agent private key. Expected a base64 raw 32-byte Ed25519 seed."
+        raise OpenBoxConfigError(msg) from exc
 
     return {
         OPENBOX_AGENT_DID_HEADER: identity.did,
         OPENBOX_AGENT_TIMESTAMP_HEADER: timestamp_value,
         OPENBOX_AGENT_NONCE_HEADER: nonce_value,
         OPENBOX_BODY_SHA256_HEADER: body_sha256,
-        OPENBOX_AGENT_SIGNATURE_HEADER: base64.b64encode(signature).decode("ascii"),
+        OPENBOX_AGENT_SIGNATURE_HEADER: signing_identity.sign(canonical),
     }
 
 
 def _decode_private_key_seed(private_key: str) -> bytes:
     try:
+        load_ed25519_seed(private_key)
         decoded = base64.b64decode(private_key, validate=True)
-    except ValueError as exc:
+    except (CoreOpenBoxConfigError, ValueError) as exc:
         msg = "Invalid OpenBox agent private key. Expected a base64 raw 32-byte Ed25519 seed."
         raise OpenBoxConfigError(msg) from exc
 
-    if (
-        len(decoded) != _ED25519_SEED_BYTE_LENGTH
-        or base64.b64encode(decoded).decode("ascii") != private_key
-    ):
+    if len(decoded) != 32 or base64.b64encode(decoded).decode("ascii") != private_key:
         msg = "Invalid OpenBox agent private key. Expected a base64 raw 32-byte Ed25519 seed."
         raise OpenBoxConfigError(msg)
 
