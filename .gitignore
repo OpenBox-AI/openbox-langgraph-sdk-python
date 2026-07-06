@@ -8,3 +8,6 @@ build/
 .DS_Store
 repomix-output.xml
 .vscode/
+_notes/
+plans/
+.claude/
