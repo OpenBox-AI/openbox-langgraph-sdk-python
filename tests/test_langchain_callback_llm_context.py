@@ -25,8 +25,10 @@ from __future__ import annotations
 from typing import Annotated, Any, TypedDict
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.outputs import ChatResult
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -150,7 +152,9 @@ def _llm_payloads(fake_core: FakeCore, event_type: str) -> list[dict[str, Any]]:
     `test_langchain_callback_tool_ordering.py`'s identical rationale) — the
     flat `event_type` wire field is the discriminator instead.
     """
-    return [p for p in fake_core.payloads if p.get("event_type") == event_type]
+    return [
+        p for p in fake_core.payloads if p.get("event_type") == event_type and not p.get("spans")
+    ]
 
 
 async def test_trace_registered_before_provider_call_and_same_id_close() -> None:
@@ -176,6 +180,66 @@ async def test_trace_registered_before_provider_call_and_same_id_close() -> None
     assert len(completed) == 1
     assert started[0]["activity_id"] == completed[0]["activity_id"]
     assert not started[0]["activity_id"].endswith("-c")
+
+
+async def test_provider_http_spans_attach_to_callback_owned_llm_activity() -> None:
+    """A normal chat-model provider HTTP call needs no app tracing glue.
+
+    The LangChain callback owns the LLM activity and creates the parent span
+    before the model body runs; base HTTPX instrumentation then emits both hook
+    stages under that same LLM activity.
+    """
+    fake_core = FakeCore()
+    store = ContextStore()
+    adapter = LangGraphFrameworkAdapter(context_store=store)
+
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+
+    class _HttpModel(FakeMessagesListChatModel):
+        async def _agenerate(self, messages: Any, *args: Any, **kwargs: Any) -> ChatResult:
+            async def transport(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, json={"id": "chatcmpl-test"})
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+                await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            return super()._generate(messages, *args, **kwargs)
+
+    model = _HttpModel(responses=[AIMessage(content="ok")])
+
+    async def call_model(state: _AgentState) -> dict[str, Any]:
+        result = await model.ainvoke(state["messages"])
+        return {"messages": [result]}
+
+    graph = StateGraph(_AgentState)
+    graph.add_node("agent", call_model)
+    graph.add_edge(START, "agent")
+    graph.add_edge("agent", END)
+    compiled = graph.compile()
+
+    with installed_conformance_runtime(fake_core, adapter, store) as runtime:
+        handler = _build_handler_with_bridge(compiled, runtime, use_gate_client=True)
+        await handler.ainvoke(
+            {"messages": [HumanMessage(content="hi")]},
+            config={"configurable": {"thread_id": "llm-ctx-provider-http"}},
+        )
+
+    llm_started = _llm_payloads(fake_core, "ActivityStarted")
+    assert len(llm_started) == 1
+    llm_activity_id = llm_started[0]["activity_id"]
+
+    hook_spans = [
+        (payload, payload["spans"][0])
+        for payload in fake_core.payloads
+        if payload.get("spans")
+        and payload["spans"][0].get("http_url") == "https://api.openai.com/v1/chat/completions"
+    ]
+    assert len(hook_spans) == 2
+    assert [span["stage"] for _, span in hook_spans] == ["started", "completed"]
+    assert {payload["activity_id"] for payload, _ in hook_spans} == {llm_activity_id}
+    assert hook_spans[0][1]["span_id"] == hook_spans[1][1]["span_id"]
 
 
 async def test_first_call_resolves_via_event_run_id_alias_no_orphan_c_row() -> None:
@@ -224,9 +288,7 @@ async def test_pre_screen_reused_exactly_one_activity_started_for_call_one() -> 
         )
 
     started = _llm_payloads(fake_core, "ActivityStarted")
-    assert len(started) == 1, (
-        "pre-screen verdict must be REUSED, not a second independent evaluate"
-    )
+    assert len(started) == 1, "pre-screen verdict must be REUSED, not a second independent evaluate"
 
 
 async def test_redaction_mutates_pre_call_message() -> None:

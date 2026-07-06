@@ -71,11 +71,9 @@ class _RecordingClient(_AllowEverythingClient):
         return await super().evaluate_event(event)
 
 
-# Phase 5 — see test_langchain_callback_tool_ordering.py's identical
-# constant docstring: `activity_type` differs between LLM ActivityStarted
-# (serialized model name) and ActivityCompleted (hardcoded `"llm"` in
-# `openbox_langchain`'s `_finish_llm`).
-_LLM_ACTIVITY_TYPES = frozenset({"FakeMessagesListChatModel", "llm"})
+# LLM lifecycle is callback-owned too, but this module is scoped to tool
+# ownership/dedup. Exclude the normalized LLM activity type from tool filters.
+_LLM_ACTIVITY_TYPES = frozenset({"llm_call"})
 
 
 def _lifecycle_payloads(
@@ -345,9 +343,7 @@ async def test_nested_agent_graph_inner_tool_sent_once() -> None:
     inner_graph.add_node("agent", inner_call_model)
     inner_graph.add_node("tools", ToolNode([inner_tool]))
     inner_graph.add_edge(START, "agent")
-    inner_graph.add_conditional_edges(
-        "agent", inner_should_continue, {"tools": "tools", END: END}
-    )
+    inner_graph.add_conditional_edges("agent", inner_should_continue, {"tools": "tools", END: END})
     inner_graph.add_edge("tools", "agent")
     inner_compiled = inner_graph.compile()
 
