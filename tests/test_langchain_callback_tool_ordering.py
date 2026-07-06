@@ -145,14 +145,9 @@ def _reset_body_effects() -> Any:
     _body_effects.clear()
 
 
-# Phase 5 — the pure-LangChain-Core LLM mixin sets `activity_type` to the
-# serialized model's `name` on ActivityStarted (this module's one fake model,
-# `FakeMessagesListChatModel`) but hardcodes the literal string `"llm"` on
-# ActivityCompleted (`core_callback_async_llm_mixin.py`'s `_finish_llm` calls
-# `send_llm_completed(options, activity_id, "llm", ...)`) — an asymmetry in
-# `openbox_langchain` (a separate package/phase), not something this test
-# module's filter can avoid by using one label.
-_LLM_ACTIVITY_TYPES = frozenset({"FakeMessagesListChatModel", "llm"})
+# LLM lifecycle is callback-owned too, but this module is scoped to tool
+# ordering. Exclude the normalized LLM activity type from tool payload filters.
+_LLM_ACTIVITY_TYPES = frozenset({"llm_call"})
 
 
 def _lifecycle_payloads(

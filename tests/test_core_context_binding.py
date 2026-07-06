@@ -187,9 +187,7 @@ async def test_llm_start_registers_distinct_trace_from_tool(make_handler) -> Non
         data={"input": {"messages": [[{"type": "human", "content": "hi"}]]}},
         parent_ids=["parent-run-1"],
     )
-    await handler._process_event(
-        llm_event, "thread-1", workflow_id, run_id, root_tracker, buffer
-    )
+    await handler._process_event(llm_event, "thread-1", workflow_id, run_id, root_tracker, buffer)
 
     buf = buffer.get("llm-run-1")
     assert buf is not None and buf.otel_span is not None
@@ -206,11 +204,11 @@ async def test_llm_start_registers_distinct_trace_from_tool(make_handler) -> Non
 async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_handler) -> None:
     """Phase 5 rebuild (Scope F8): the shared pure-LangChain-Core callback
     (not the retired `_GuardrailsCallbackHandler`) now owns LLM start/end —
-    it fires before the real chat-model HTTP request and must register the
-    ambient OTel trace immediately, because the later LangGraph stream event
-    (consumer fallback) arrives too late for started/preflight hooks AND
-    must not create a COMPETING trace binding once the callback owns this
-    call (`skip_consumer_side_effects`, C7 extended to LLM).
+    it fires before the real chat-model HTTP request and must register an
+    SDK-owned LLM parent trace immediately, because the later LangGraph stream
+    event (consumer fallback) arrives too late for started/preflight hooks AND
+    must not create a COMPETING trace binding once the callback owns this call
+    (`skip_consumer_side_effects`, C7 extended to LLM).
 
     Uses the SAME `OpenBoxLangChainCoreAsyncCallbackHandler` + `ActivityBridge`
     wiring `_governed_config` installs in production (registry-backed
@@ -253,9 +251,9 @@ async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_
         assert record.activity_id == event_run_id
         assert record.llm_started_sent is True
 
-        # The callback registers under whatever trace is AMBIENT at call
-        # time (module docstring of `register_llm_trace`) — no separate span
-        # of its own — so the trace id is the parent's.
+        # The callback creates the LLM parent span before provider I/O. It is
+        # a child in the current trace, so hooks under the provider call resolve
+        # through this same trace id.
         assert otel_trace.get_current_span().get_span_context().trace_id == parent_trace_id
 
         core_ctx = handler._core_runtime.context_store.context_for_trace(parent_trace_id)  # type: ignore[union-attr]
@@ -263,7 +261,7 @@ async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_
         assert core_ctx.workflow_id == workflow_id
         assert core_ctx.run_id == run_id
         assert core_ctx.activity_id == event_run_id
-        assert core_ctx.activity_type == "ChatOpenAI"
+        assert core_ctx.activity_type == "llm_call"
 
         root_tracker, buffer = _RootRunTracker(), _RunBufferManager()
         llm_event = LangGraphStreamEvent(
@@ -275,7 +273,12 @@ async def test_pre_llm_callback_registers_active_trace_before_stream_event(make_
             parent_ids=[],
         )
         await handler._process_event(
-            llm_event, "thread-callback-bind", workflow_id, run_id, root_tracker, buffer,
+            llm_event,
+            "thread-callback-bind",
+            workflow_id,
+            run_id,
+            root_tracker,
+            buffer,
         )
         buf = buffer.get(event_run_id)
         assert buf is not None
@@ -334,8 +337,12 @@ async def test_injected_client_is_lifecycle_only_no_span_no_registration() -> No
 
     root_tracker, buffer = _RootRunTracker(), _RunBufferManager()
     await handler._process_event(
-        _tool_start_event("tool-run-3"), "thread-1", "wf-bind-4", "run-bind-4",
-        root_tracker, buffer,
+        _tool_start_event("tool-run-3"),
+        "thread-1",
+        "wf-bind-4",
+        "run-bind-4",
+        root_tracker,
+        buffer,
     )
 
     buf = buffer.get("tool-run-3")
