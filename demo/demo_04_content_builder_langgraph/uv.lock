@@ -608,7 +608,7 @@ wheels = [
 
 [[package]]
 name = "langsmith"
-version = "0.9.7"
+version = "0.9.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -626,9 +626,9 @@ dependencies = [
     { name = "xxhash" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d4/8b/a56b97a3b8a94f850fe2ec42351d4c508cc6bd7ca96644906c311e32ec5b/langsmith-0.9.7.tar.gz", hash = "sha256:40f8a66a466a7abd991a9df1b50de0a9d30c48ee0d3da46ce00516b68e41c9d7", size = 4711142, upload-time = "2026-07-02T20:11:09.619Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/68/8d8471233ee0cd82c2af946d76f80a01aeb8bb04160c392c1229fddf5d3d/langsmith-0.9.8.tar.gz", hash = "sha256:8c3d6a6d5246a3ea6d439b726d59edefba31dfb251de9eedb256119bbea4439e", size = 4710812, upload-time = "2026-07-06T19:06:10.866Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/95/0abb8647123c9ebbb31162bcdba3183f5f3d3bb2f752ef3d777ab715e88c/langsmith-0.9.7-py3-none-any.whl", hash = "sha256:a5ff9179b77eb0c3a0129294d30924eab13e51e2720f374372dbbc014c892911", size = 671052, upload-time = "2026-07-02T20:11:07.702Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/67/a85caaa99117bbc988a0df7faa39e7f68344361854638d86bcce0ffe3619/langsmith-0.9.8-py3-none-any.whl", hash = "sha256:098da9fc6c184284f17913cb813a41e28c5ab1508e90bd50db40c28166681017", size = 671148, upload-time = "2026-07-06T19:06:08.911Z" },
 ]
 
 [[package]]
@@ -692,6 +692,7 @@ dependencies = [
     { name = "httpx" },
     { name = "langchain-core" },
     { name = "langgraph" },
+    { name = "langsmith" },
     { name = "openbox-langchain-sdk-python" },
     { name = "openbox-sdk-python" },
     { name = "opentelemetry-api" },
@@ -715,9 +716,10 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "langchain-core", specifier = ">=1.3.3" },
     { name = "langgraph", specifier = ">=0.2.0" },
+    { name = "langsmith", specifier = ">=0.8.18" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10.0" },
     { name = "openbox-langchain-sdk-python", specifier = ">=1.0.0" },
-    { name = "openbox-sdk-python", editable = "../../../openbox-sdk-python" },
+    { name = "openbox-sdk-python", specifier = ">=1.0.1" },
     { name = "opentelemetry-api", specifier = ">=1.20.0" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.20.0" },
     { name = "opentelemetry-instrumentation-asyncpg", specifier = ">=0.41b0" },
@@ -748,43 +750,16 @@ provides-extras = ["otel", "dev"]
 [[package]]
 name = "openbox-sdk-python"
 version = "1.0.1"
-source = { editable = "../../../openbox-sdk-python" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "asyncpg", marker = "extra == 'db'", specifier = ">=0.29.0" },
-    { name = "cryptography", specifier = ">=48.0.1,<50" },
-    { name = "httpx", specifier = ">=0.28.0,<1" },
-    { name = "opentelemetry-api", specifier = ">=1.38.0,<1.40.0" },
-    { name = "opentelemetry-instrumentation-asyncpg", marker = "extra == 'db'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-dbapi", marker = "extra == 'db'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'http'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-redis", marker = "extra == 'db'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-requests", marker = "extra == 'http'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'db'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-urllib", marker = "extra == 'http'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-instrumentation-urllib3", marker = "extra == 'http'", specifier = ">=0.59b0,<0.61b0" },
-    { name = "opentelemetry-sdk", specifier = ">=1.38.0,<1.40.0" },
-    { name = "pymongo", marker = "extra == 'db'", specifier = ">=4.6.0" },
-    { name = "redis", marker = "extra == 'db'", specifier = ">=5.0.0" },
-    { name = "requests", marker = "extra == 'http'", specifier = ">=2.31.0" },
-    { name = "sqlalchemy", marker = "extra == 'db'", specifier = ">=2.0.0" },
-    { name = "wrapt", marker = "extra == 'db'", specifier = ">=1.16.0" },
-]
-provides-extras = ["http", "db"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.16.0,<2" },
-    { name = "pytest", specifier = ">=8.2" },
-    { name = "pytest-asyncio", specifier = ">=0.26.0,<0.27" },
-    { name = "ruff", specifier = ">=0.8.0" },
+sdist = { url = "https://files.pythonhosted.org/packages/61/14/630c83f0aed9a60584273a36536693739ea1336aa543f5090e8b540d14c9/openbox_sdk_python-1.0.1.tar.gz", hash = "sha256:1efe7975f9cde7ec31dbab2eea5e329acf685c378cffe93157118a885f39460d", size = 173712, upload-time = "2026-07-06T19:39:51.965Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/53/9d169fd9e74f5f107982fd97a9dd38a43b68e9f4a29128883f79eab96a2d/openbox_sdk_python-1.0.1-py3-none-any.whl", hash = "sha256:0e202aed93be2b1e4e76ce5ce2c628ce5bc64eae59c6297547be5b634bca01f9", size = 87825, upload-time = "2026-07-06T19:39:50.53Z" },
 ]
 
 [[package]]
