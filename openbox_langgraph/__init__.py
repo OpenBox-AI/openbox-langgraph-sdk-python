@@ -17,7 +17,7 @@ Example:
     ... )
 """
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 
 from openbox_langgraph.client import GovernanceClient, build_auth_headers
 from openbox_langgraph.config import (
