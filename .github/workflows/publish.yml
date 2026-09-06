@@ -342,7 +342,7 @@ jobs:
         id: sonarqube_quality_gate
         if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
         continue-on-error: true
-        uses: SonarSource/sonarqube-quality-gate-action@master
+        uses: SonarSource/sonarqube-quality-gate-action@v1.2.0
         with:
           pollingTimeoutSec: 600
         env:
