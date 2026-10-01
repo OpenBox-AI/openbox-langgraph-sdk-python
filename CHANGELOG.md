@@ -4,6 +4,8 @@
 
 - Upgrade `openbox-sdk-python` to `>=1.4.0` for IAM v3 workload identity. Keep
   `openbox-langchain-sdk-python` at `>=1.0.0` (locked to 1.0.0).
+- Update locked AnyIO to 4.14.2 and urllib3 to 2.8.0 in the SDK and demo, plus
+  pyasn1 to 0.6.4 in the demo, to address Trivy's critical/high findings.
 - Add `workload_private_key` to initialization, graph creation, runtime creation,
   and standalone governance clients, with framework/global environment support
   during initialization and runtime creation.
