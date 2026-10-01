@@ -2,7 +2,7 @@
 
 ## 1.1.0
 
-- Upgrade `openbox-sdk-python` to `>=1.3.1` for IAM v3 workload identity. Keep
+- Upgrade `openbox-sdk-python` to `>=1.4.0` for IAM v3 workload identity. Keep
   `openbox-langchain-sdk-python` at `>=1.0.0` (locked to 1.0.0).
 - Add `workload_private_key` to initialization, graph creation, runtime creation,
   and standalone governance clients, with framework/global environment support
