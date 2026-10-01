@@ -47,6 +47,7 @@ EXPECTED_EXPORTS = frozenset(
         "OpenBoxLangGraphHandler",
         "OpenBoxLangGraphHandlerOptions",
         "OpenBoxNetworkError",
+        "OpenBoxSigningError",
         "Verdict",
         "VerdictContext",
         "WorkflowEventType",
@@ -100,9 +101,9 @@ def test_all_entries_are_importable() -> None:
 def test_all_has_no_duplicates() -> None:
     names = list(openbox_langgraph.__all__)
     assert len(names) == len(set(names)), "duplicate names in __all__"
-    # Public surface is 56 (55 baseline exports + __version__); a change here is
+    # Public surface is 57 (including the IAM v3 signing error); a change here is
     # a deliberate surface change.
-    assert len(EXPECTED_EXPORTS) == 56
+    assert len(EXPECTED_EXPORTS) == 57
 
 
 def test_legacy_otel_setup_export_is_a_raising_shim() -> None:

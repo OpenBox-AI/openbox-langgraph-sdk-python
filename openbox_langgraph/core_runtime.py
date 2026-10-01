@@ -42,6 +42,7 @@ from openbox_core.runtime import OpenBoxRuntime
 
 from openbox_langgraph.config import GovernanceConfig
 from openbox_langgraph.errors import OpenBoxConfigError
+from openbox_langgraph.identity import parse_optional_workload_private_key
 from openbox_langgraph.trace_context_registry import (
     TraceContextRegistry,
     get_context_store,
@@ -53,7 +54,7 @@ from openbox_langgraph.trace_context_registry import (
 CORE_ENV_PREFIX = "OPENBOX_LANGGRAPH"
 SDK_ENGINE = "langgraph"
 SDK_LANGUAGE = "python"
-SDK_PACKAGE_VERSION = "1.0.0"
+SDK_PACKAGE_VERSION = "1.1.0"
 
 __all__ = [
     "CORE_ENV_PREFIX",
@@ -72,6 +73,7 @@ def create_core_runtime(
     governance_timeout: float | None = None,
     agent_did: str | None = None,
     agent_private_key: str | None = None,
+    workload_private_key: str | None = None,
     extra_ignored_urls: set[str] | None = None,
 ) -> OpenBoxRuntime:
     """Resolve base-SDK config and build an isolated ``OpenBoxRuntime``.
@@ -124,10 +126,14 @@ def create_core_runtime(
         agent_name=config.agent_name,
         agent_did=agent_did,
         agent_private_key=agent_private_key,
+        workload_private_key=workload_private_key,
         sdk_version=SDK_PACKAGE_VERSION,
         sdk_engine=SDK_ENGINE,
         sdk_language=SDK_LANGUAGE,
         validate=True,
+    )
+    core_config.workload_private_key = parse_optional_workload_private_key(
+        core_config.workload_private_key
     )
 
     from openbox_core.context import ContextStore

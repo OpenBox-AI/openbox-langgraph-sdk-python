@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 
 class OpenBoxError(Exception):
     """Base class for all OpenBox SDK errors."""
 
 
 class OpenBoxAuthError(OpenBoxError):
-    """Raised when the API key is invalid or unauthorized."""
+    """Raised when the API key or workload identity is invalid or unauthorized."""
+
+
+class OpenBoxSigningError(OpenBoxAuthError):
+    """Identity proof rejected by Core, with its machine-readable reason code."""
+
+    def __init__(self, message: str, reason_code: str | None = None) -> None:
+        self.reason_code = reason_code
+        super().__init__(message)
 
 
 class OpenBoxConfigError(OpenBoxError):
@@ -21,6 +31,25 @@ class OpenBoxNetworkError(OpenBoxError):
 
 class OpenBoxInsecureURLError(OpenBoxError):
     """Raised when an insecure HTTP URL is used for a non-localhost endpoint."""
+
+
+def _raise_core_error(exc: Exception) -> NoReturn:
+    """Keep base-SDK auth/configuration failures in this SDK's public hierarchy."""
+    from openbox_core.errors import GovernanceAPIError as CoreGovernanceAPIError
+    from openbox_core.errors import OpenBoxAuthError as CoreOpenBoxAuthError
+    from openbox_core.errors import OpenBoxConfigError as CoreOpenBoxConfigError
+    from openbox_core.errors import OpenBoxNetworkError as CoreOpenBoxNetworkError
+    from openbox_core.errors import OpenBoxSigningError as CoreOpenBoxSigningError
+
+    if isinstance(exc, CoreOpenBoxSigningError):
+        raise OpenBoxSigningError(str(exc), exc.reason_code) from exc
+    if isinstance(exc, CoreOpenBoxAuthError):
+        raise OpenBoxAuthError(str(exc)) from exc
+    if isinstance(exc, (CoreOpenBoxNetworkError, CoreGovernanceAPIError)):
+        raise OpenBoxNetworkError(str(exc)) from exc
+    if isinstance(exc, CoreOpenBoxConfigError):
+        raise OpenBoxConfigError(str(exc)) from exc
+    raise exc
 
 
 class GovernanceBlockedError(OpenBoxError):

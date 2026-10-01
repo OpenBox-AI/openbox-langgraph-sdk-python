@@ -23,9 +23,17 @@ import pytest
 from openbox_core.contracts.results import EvaluationResult
 from openbox_core.contracts.results import Verdict as CoreVerdict
 from openbox_core.errors import ContractError, GovernanceAPIError
+from openbox_core.errors import OpenBoxAuthError as CoreAuthError
+from openbox_core.errors import OpenBoxConfigError as CoreConfigError
+from openbox_core.errors import OpenBoxSigningError as CoreSigningError
 
-from openbox_langgraph.client import _gate_evaluate
-from openbox_langgraph.errors import OpenBoxNetworkError
+from openbox_langgraph.client import GovernanceClient, _gate_evaluate
+from openbox_langgraph.errors import (
+    OpenBoxAuthError,
+    OpenBoxConfigError,
+    OpenBoxNetworkError,
+    OpenBoxSigningError,
+)
 from openbox_langgraph.types import LangChainGovernanceEvent, Verdict
 
 
@@ -57,6 +65,30 @@ class _Gate:
             raise self._exc
         assert self._result is not None
         return self._result
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (CoreAuthError("rejected"), OpenBoxAuthError),
+        (CoreSigningError("revoked", "workload_identity_revoked"), OpenBoxSigningError),
+        (CoreConfigError("invalid bootstrap"), OpenBoxConfigError),
+    ],
+)
+async def test_auth_and_configuration_errors_never_become_fallback_allow(error, expected):
+    with pytest.raises(expected):
+        await _gate_evaluate(_Gate(exc=error), _event(), "fail_open")
+
+
+async def test_rejected_gate_event_is_not_deduplicated_into_allow() -> None:
+    client = GovernanceClient(
+        api_url="https://core.example.test",
+        api_key="obx_test_key",
+        gate=_Gate(exc=CoreAuthError("rejected")),
+    )
+    for _ in range(2):
+        with pytest.raises(OpenBoxAuthError):
+            await client.evaluate_event(_event())
 
 
 @pytest.mark.asyncio

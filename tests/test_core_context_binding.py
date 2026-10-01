@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -21,6 +22,7 @@ import pytest
 pytest.importorskip("openbox_core")
 
 from langchain_core.messages import HumanMessage
+from openbox_core.contracts.results import EvaluationResult
 from openbox_langchain import (
     ActivityBridge,
     OpenBoxLangChainCoreAsyncCallbackHandler,
@@ -57,7 +59,9 @@ class _AllowEverythingClient(GovernanceClient):
 
 
 @pytest.fixture
-def make_handler() -> Iterator[Callable[..., OpenBoxLangGraphHandler]]:
+def make_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[..., OpenBoxLangGraphHandler]]:
     """Factory for handlers wired with a real core runtime, without touching
     global config or making network calls.
 
@@ -82,6 +86,13 @@ def make_handler() -> Iterator[Callable[..., OpenBoxLangGraphHandler]]:
             api_url="https://core.openbox.ai",
             api_key="obx_test_abc",
             governance_timeout=30.0,
+        )
+        # Callbacks evaluate through the base runtime, bypassing the injected
+        # lifecycle stub. Mock that boundary too so this test never contacts Core.
+        monkeypatch.setattr(
+            handler._core_runtime.client,
+            "aevaluate",
+            AsyncMock(return_value=EvaluationResult.from_dict({"verdict": "allow"})),
         )
         created.append(handler)
         return handler

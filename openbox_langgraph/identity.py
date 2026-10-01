@@ -46,6 +46,20 @@ class AgentIdentityConfig:
 AgentIdentityHeaders = dict[str, str]
 
 
+def parse_optional_workload_private_key(private_key: str | None) -> str | None:
+    """Validate a workload key locally, including when startup validation is off."""
+    if private_key is None:
+        return None
+    from openbox_core.identity_okta import load_rsa_pkcs8_private_key
+
+    normalized = private_key.strip()
+    try:
+        load_rsa_pkcs8_private_key(normalized, key_label="workload_private_key")
+    except CoreOpenBoxConfigError as exc:
+        raise OpenBoxConfigError(str(exc)) from exc
+    return normalized
+
+
 def build_agent_identity_canonical_request(
     *,
     body_sha256: str,

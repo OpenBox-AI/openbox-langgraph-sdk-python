@@ -14,10 +14,12 @@ from openbox_langgraph.errors import (
     OpenBoxConfigError,
     OpenBoxInsecureURLError,
     OpenBoxNetworkError,
+    _raise_core_error,
 )
 from openbox_langgraph.identity import (
     AgentIdentityConfig,
     parse_optional_agent_identity_config,
+    parse_optional_workload_private_key,
 )
 from openbox_langgraph.types import DEFAULT_HITL_CONFIG, HITLConfig
 
@@ -193,6 +195,7 @@ class _GlobalConfigState:
     governance_timeout: float = 30.0  # seconds
     agent_did: str | None = None
     agent_private_key: str | None = None
+    workload_private_key: str | None = field(default=None, repr=False)
 
     def configure(
         self,
@@ -200,12 +203,14 @@ class _GlobalConfigState:
         api_key: str,
         governance_timeout: float = 30.0,
         agent_identity: AgentIdentityConfig | None = None,
+        workload_private_key: str | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.governance_timeout = governance_timeout
         self.agent_did = agent_identity.did if agent_identity else None
         self.agent_private_key = agent_identity.private_key if agent_identity else None
+        self.workload_private_key = workload_private_key
 
     def __repr__(self) -> str:
         if self.api_key and len(self.api_key) > 8:
@@ -293,6 +298,41 @@ def _validate_api_key_with_server(
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _validate_workload_identity_with_server(
+    api_url: str,
+    api_key: str,
+    timeout: float,
+    workload_private_key: str,
+    agent_identity: AgentIdentityConfig | None,
+) -> None:
+    """Let the base SDK bootstrap, exchange a token, and validate the active identity."""
+    from openbox_core.client import EvaluationClient
+    from openbox_core.errors import OpenBoxConfigError as CoreOpenBoxConfigError
+    from openbox_core.identity import AgentIdentity
+
+    from openbox_langgraph.client import _SDK_PACKAGE_VERSION
+
+    client = EvaluationClient(
+        api_url,
+        api_key,
+        timeout_seconds=timeout,
+        workload_private_key=workload_private_key,
+        identity=(
+            AgentIdentity.from_private_key(agent_identity.did, agent_identity.private_key)
+            if agent_identity
+            else None
+        ),
+        sdk_version=_SDK_PACKAGE_VERSION,
+        sdk_engine="langgraph",
+    )
+    try:
+        client.validate_api_key()
+    except CoreOpenBoxConfigError as exc:
+        _raise_core_error(exc)
+    finally:
+        client.close()
+
+
 def initialize(
     api_url: str,
     api_key: str,
@@ -300,6 +340,7 @@ def initialize(
     validate: bool = True,
     agent_did: str | None = None,
     agent_private_key: str | None = None,
+    workload_private_key: str | None = None,
 ) -> None:
     """Initialize the OpenBox LangGraph SDK with credentials.
 
@@ -314,6 +355,8 @@ def initialize(
         agent_did: Optional OpenBox agent DID. Falls back to `OPENBOX_AGENT_DID`.
         agent_private_key: Optional raw Ed25519 private key seed. Falls back to
             `OPENBOX_AGENT_PRIVATE_KEY`.
+        workload_private_key: PKCS8 PEM RSA key for IAM v3. Falls back to
+            `OPENBOX_LANGGRAPH_WORKLOAD_PRIVATE_KEY`, then `OPENBOX_WORKLOAD_PRIVATE_KEY`.
     """
     import os
 
@@ -337,7 +380,17 @@ def initialize(
     except OpenBoxConfigError:
         raise
 
-    if validate:
+    if workload_private_key is None:
+        workload_private_key = os.environ.get(
+            "OPENBOX_LANGGRAPH_WORKLOAD_PRIVATE_KEY", os.environ.get("OPENBOX_WORKLOAD_PRIVATE_KEY")
+        )
+    workload_private_key = parse_optional_workload_private_key(workload_private_key)
+
+    if validate and workload_private_key is not None:
+        _validate_workload_identity_with_server(
+            api_url.rstrip("/"), api_key, governance_timeout, workload_private_key, agent_identity
+        )
+    elif validate:
         _validate_api_key_with_server(
             api_url.rstrip("/"),
             api_key,
@@ -350,6 +403,7 @@ def initialize(
         api_key,
         governance_timeout,
         agent_identity,
+        workload_private_key,
     )
 
     _get_logger().info(f"OpenBox LangGraph SDK initialized with API URL: {api_url}")

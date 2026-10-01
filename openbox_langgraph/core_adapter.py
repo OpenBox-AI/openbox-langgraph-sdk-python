@@ -92,7 +92,9 @@ class LangGraphFrameworkAdapter:
 
     # ── Approval (RAISE-ONLY — never an inline blocking wait) ──────────────
 
-    async def handle_approval(self, result: EvaluationResult) -> None:
+    async def handle_approval(
+        self, result: EvaluationResult, context: ActivityContext | None = None
+    ) -> None:
         """Async started-hook REQUIRE_APPROVAL -> raise, never await inline.
 
         The base ``HookRuntime._adecide_started`` treats a normal RETURN as
@@ -100,7 +102,8 @@ class LangGraphFrameworkAdapter:
         signal for a ``requires_approval()`` verdict, so the handler's outer
         catch/poll/retry loop drives the approval flow.
         """
-        self._raise_pending_approval(result, self._store.current_activity_context())
+        ctx = context if context is not None else self._store.current_activity_context()
+        self._raise_pending_approval(result, ctx)
 
     def handle_approval_sync(
         self, result: EvaluationResult, *, context: ActivityContext | None = None
@@ -138,7 +141,9 @@ class LangGraphFrameworkAdapter:
 
     # ── Completed-hook telemetry (never undoes the operation) ──────────────
 
-    def on_completed_hook_result(self, result: EvaluationResult) -> None:
+    def on_completed_hook_result(
+        self, result: EvaluationResult, context: ActivityContext | None = None
+    ) -> None:
         """Completed verdicts affect FUTURE execution only — the operation
         already ran. ``HookRuntime._after_completed`` has already marked the
         abort/halt flags on the base ``ContextStore`` for a stop-shaped
