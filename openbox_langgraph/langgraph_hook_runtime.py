@@ -35,9 +35,12 @@ from typing import Any
 from openbox_core.context import activity_scope
 from openbox_core.contracts.context import ActivityContext
 from openbox_core.contracts.otel_spans import HookType
+from openbox_core.errors import OpenBoxConfigError as _CoreOpenBoxConfigError
 from openbox_core.hooks.events import resolve_context
 from openbox_core.hooks.preflight import HookRuntime
 from openbox_core.otel.trace_context import raw_trace_id
+
+from openbox_langgraph.errors import _raise_core_error
 
 __all__ = ["LangGraphHookRuntime"]
 
@@ -139,6 +142,9 @@ class LangGraphHookRuntime(HookRuntime):
             proceed = super().preflight(
                 span, hook_type=hook_type, identifier=identifier, fields=fields
             )
+        except _CoreOpenBoxConfigError as exc:
+            self._unpin(key)
+            _raise_core_error(exc)
         except BaseException:
             # Blocked / halted / approval-rejected: no completed callback will
             # follow, so drop the pin rather than leak it.
@@ -161,6 +167,9 @@ class LangGraphHookRuntime(HookRuntime):
             proceed = await super().apreflight(
                 span, hook_type=hook_type, identifier=identifier, fields=fields
             )
+        except _CoreOpenBoxConfigError as exc:
+            self._unpin(key)
+            _raise_core_error(exc)
         except BaseException:
             self._unpin(key)
             raise

@@ -134,6 +134,20 @@ class TestApprovalIsRaiseOnly:
         assert exc_info.value.verdict == "require_approval"
         assert store.is_activity_aborted(_CTX.workflow_id, _CTX.activity_id)
 
+    async def test_async_approval_uses_context_supplied_by_base_runtime(self) -> None:
+        adapter, store = _bound_adapter()
+        other_ctx = ActivityContext(
+            workflow_id="wf-explicit", run_id="run-explicit", activity_id="act-explicit",
+            activity_type="tool_call",
+        )
+        with pytest.raises(GovernanceBlockedError) as error:
+            await adapter.handle_approval(
+                EvaluationResult(verdict=Verdict.REQUIRE_APPROVAL), context=other_ctx
+            )
+        assert error.value.identifier == "act-explicit"
+        assert store.is_activity_aborted("wf-explicit", "act-explicit")
+        assert not store.is_activity_aborted(_CTX.workflow_id, _CTX.activity_id)
+
     def test_sync_handle_approval_prefers_explicit_context_over_ambient(self) -> None:
         """`context=` passed explicitly (the span-resolved context
         `HookRuntime._sync_approval` supplies) must win over whatever is

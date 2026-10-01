@@ -94,17 +94,14 @@ uv add openbox-langgraph-sdk-python
 
 ### 1. Get your agent credentials
 
-Sign in to [dashboard.openbox.ai](https://dashboard.openbox.ai), create an agent called `"MyAgent"`, and copy the agent API key plus its DID credentials.
-
-New OpenBox agents have DID signing enabled by default. Keep the private key secret and load it from your environment.
+Sign in to [dashboard.openbox.ai](https://dashboard.openbox.ai), create an agent called `"MyAgent"`, and copy its API key. For an IAM v3 workload-enabled agent, also load the PKCS8 PEM RSA private key registered for its active Keycloak service account. Keep the key secret.
 
 ### 2. Set environment variables
 
 ```bash
 export OPENBOX_URL="https://core.openbox.ai"
 export OPENBOX_API_KEY="obx_live_..."
-export OPENBOX_AGENT_DID="did:aip:..."
-export OPENBOX_AGENT_PRIVATE_KEY="..."
+export OPENBOX_WORKLOAD_PRIVATE_KEY="$(cat /path/to/workload-private-key.pem)"
 ```
 
 ### 3. Wrap your graph
@@ -139,6 +136,50 @@ asyncio.run(main())
 
 That's it. Your agent now sends governance events to OpenBox on every tool call, LLM prompt, HTTP request, and database query.
 
+### IAM v3 workload identity
+
+IAM v3 is provided by `openbox-sdk-python>=1.3.1`. The existing
+`openbox-langchain-sdk-python` dependency remains at `>=1.0.0`; its callbacks
+use the same base runtime as the LangGraph handler and operation hooks.
+
+You can pass the workload key explicitly instead of setting an environment variable:
+
+```python
+governed = create_openbox_graph_handler(
+    graph=agent,
+    api_url=os.environ["OPENBOX_URL"],
+    api_key=os.environ["OPENBOX_API_KEY"],
+    workload_private_key=os.environ["OPENBOX_WORKLOAD_PRIVATE_KEY"],
+)
+```
+
+Key resolution is explicit argument, then `OPENBOX_LANGGRAPH_WORKLOAD_PRIVATE_KEY`,
+then `OPENBOX_WORKLOAD_PRIVATE_KEY`. The value is the PEM contents, not a file path.
+The Python base SDK selects workload authentication from this key; no
+`OPENBOX_AGENT_IDENTITY_METHOD` setting is needed for IAM v3.
+
+The base SDK fetches `/api/v3/auth/bootstrap`, exchanges a signed `private_key_jwt`
+for a short-lived Keycloak token, and sends the API key plus
+`X-OpenBox-Workload-Token` on v3 validation, evaluation, and approval requests.
+It owns token caching and refresh for OpenBox-, Okta-, and Entra-managed identities.
+Lifecycle callbacks, hooks, synchronous/raw evaluations, and approval polling share
+the handler's runtime client. A standalone `GovernanceClient` also accepts
+`workload_private_key`; call `await client.close()` when finished with it.
+
+Authentication and signing failures raise `OpenBoxAuthError` or its subclass
+`OpenBoxSigningError` even with `on_api_error="fail_open"`. The signing error retains
+Core's `reason_code`. Invalid bootstrap metadata raises `OpenBoxConfigError`, and
+bootstrap/token service outages raise `OpenBoxNetworkError`; these do not become
+implicit ALLOW or pending approval results. `validate=False` skips the startup
+network check only: the key is still validated locally, and runtime requests
+still authenticate.
+
+The base SDK preserves rolling-upgrade compatibility: bootstrap HTTP 404, or
+HTTP 409 with `workload_identity_unavailable`, retains the configured legacy route.
+Other bootstrap failures do not downgrade. Existing DID signing remains available
+through `agent_did`/`agent_private_key` or `OPENBOX_AGENT_DID`/`OPENBOX_AGENT_PRIVATE_KEY`.
+Without identity credentials, the existing API-key-only behavior is preserved.
+
 ### Try it locally (included test agent)
 
 The repository includes a runnable LangGraph test agent under `test-agent/`.
@@ -165,6 +206,7 @@ See `test-agent/README.md` for setup and run instructions.
 | `api_key` | `str` | **required** | API key (`obx_live_*` or `obx_test_*`) |
 | `agent_did` | `str` | `OPENBOX_AGENT_DID` | Agent DID used to sign governance requests |
 | `agent_private_key` | `str` | `OPENBOX_AGENT_PRIVATE_KEY` | Base64 raw Ed25519 private key seed for the agent DID |
+| `workload_private_key` | `str` | `OPENBOX_LANGGRAPH_WORKLOAD_PRIVATE_KEY`, then `OPENBOX_WORKLOAD_PRIVATE_KEY` | PKCS8 PEM RSA key for IAM v3 workload authentication |
 | `agent_name` | `str` | `None` | Agent name as configured in the dashboard |
 | `validate` | `bool` | `True` | Validate API key against server on startup |
 | `on_api_error` | `str` | `"fail_open"` | `"fail_open"` (allow on error) or `"fail_closed"` (block on error) |

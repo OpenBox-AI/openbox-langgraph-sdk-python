@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0
+
+- Upgrade `openbox-sdk-python` to `>=1.3.1` for IAM v3 workload identity. Keep
+  `openbox-langchain-sdk-python` at `>=1.0.0` (locked to 1.0.0).
+- Add `workload_private_key` to initialization, graph creation, runtime creation,
+  and standalone governance clients, with framework/global environment support
+  during initialization and runtime creation.
+- Delegate workload bootstrap, token exchange, caching, and refresh to the base
+  SDK. Reuse the handler's runtime client for validation, sync/raw evaluation,
+  and approval polling alongside callbacks and operation hooks.
+- Preserve authentication, signing, and bootstrap/configuration errors under
+  fail-open policies. Export `OpenBoxSigningError` with Core's `reason_code`.
+- Preserve legacy DID/API-key configuration and the base SDK's explicit
+  no-workload-authority fallback for rolling upgrades.
+
 ## 0.3.0
 
 Migrates the SDK onto the shared `openbox-sdk-python` (`openbox_core`) governance

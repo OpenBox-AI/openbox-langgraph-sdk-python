@@ -17,7 +17,7 @@ Example:
     ... )
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from openbox_langgraph.client import GovernanceClient, build_auth_headers
 from openbox_langgraph.config import (
@@ -38,6 +38,7 @@ from openbox_langgraph.errors import (
     OpenBoxError,
     OpenBoxInsecureURLError,
     OpenBoxNetworkError,
+    OpenBoxSigningError,
 )
 from openbox_langgraph.hitl import poll_until_decision
 from openbox_langgraph.identity import (
@@ -112,6 +113,7 @@ __all__ = [
     "OpenBoxLangGraphHandler",
     "OpenBoxLangGraphHandlerOptions",
     "OpenBoxNetworkError",
+    "OpenBoxSigningError",
     "Verdict",
     "VerdictContext",
     "WorkflowEventType",

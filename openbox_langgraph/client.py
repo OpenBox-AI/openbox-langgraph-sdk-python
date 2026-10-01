@@ -13,14 +13,20 @@ from openbox_core.contracts.results import EvaluationResult
 from openbox_core.contracts.results import Verdict as _CoreVerdict
 from openbox_core.errors import ContractError as _CoreContractError
 from openbox_core.errors import GovernanceAPIError as _CoreGovernanceAPIError
-from openbox_core.errors import OpenBoxNetworkError as _CoreOpenBoxNetworkError
+from openbox_core.errors import OpenBoxConfigError as _CoreOpenBoxConfigError
 
 from openbox_langgraph.core_events import to_envelope
-from openbox_langgraph.errors import OpenBoxConfigError, OpenBoxNetworkError
+from openbox_langgraph.errors import (
+    OpenBoxConfigError,
+    OpenBoxError,
+    OpenBoxNetworkError,
+    _raise_core_error,
+)
 from openbox_langgraph.identity import (
     AgentIdentityConfig,
     create_agent_identity_headers,
     parse_optional_agent_identity_config,
+    parse_optional_workload_private_key,
 )
 from openbox_langgraph.types import (
     ApprovalResponse,
@@ -32,9 +38,10 @@ from openbox_langgraph.types import (
 )
 
 if TYPE_CHECKING:
+    from openbox_core.client import EvaluationClient
     from openbox_core.gate import GovernanceGate
 
-_SDK_PACKAGE_VERSION = "1.0.0"
+_SDK_PACKAGE_VERSION = "1.1.0"
 _SDK_IDENTIFIER = f"openbox-langgraph-python-v{_SDK_PACKAGE_VERSION}"
 
 
@@ -114,9 +121,11 @@ async def _gate_evaluate(
       independent of `on_api_error`. Enforcing fail_closed here would let an
       SDK-side mapping defect block a user's graph for a reason their OWN policy
       never produced — strictly worse than dropping one governance event.
-    - `GovernanceAPIError` / `OpenBoxNetworkError` (network-shaped failure) ->
-      this SDK's `OpenBoxNetworkError`, same public exception the legacy path
-      raises under fail_closed.
+    - Base authentication, signing, and configuration errors always propagate
+      through this SDK's public errors, including under fail_open.
+    - `GovernanceAPIError` / `OpenBoxNetworkError` -> this SDK's
+      `OpenBoxNetworkError`. Bootstrap/token-exchange failures must propagate;
+      the base client applies fail_open only to ordinary governance transport errors.
     - Any OTHER exception (e.g. a malformed Core 200 body the base parser
       cannot decode) is a transport-shaped fault, NOT a governance verdict:
       routed through `_network_fallback_result` so fail_open returns `None`
@@ -127,8 +136,8 @@ async def _gate_evaluate(
         result = await gate.aevaluate(to_envelope(event))
     except _CoreContractError:
         return None
-    except (_CoreGovernanceAPIError, _CoreOpenBoxNetworkError) as e:
-        raise OpenBoxNetworkError(str(e)) from e
+    except (_CoreGovernanceAPIError, _CoreOpenBoxConfigError) as e:
+        _raise_core_error(e)
     except Exception as e:
         return _network_fallback_result(on_api_error, f"Governance gate error: {e}")
     return _collapse_client_synthesized_fallback(result)
@@ -144,7 +153,8 @@ def build_auth_headers(
 ) -> dict[str, str]:
     """Build standard auth headers for governance API calls.
 
-    Single source of truth for the SDK's outbound governance requests.
+    Compatibility helper for API-key/DID requests. Workload headers are composed
+    by the base SDK after bootstrap and token exchange.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -194,6 +204,8 @@ class GovernanceClient:
         agent_did: str | None = None,
         agent_private_key: str | None = None,
         gate: GovernanceGate | None = None,
+        workload_private_key: str | None = None,
+        core_client: EvaluationClient | None = None,
     ) -> None:
         self._api_url = api_url.rstrip("/")
         self._api_key = api_key
@@ -205,13 +217,37 @@ class GovernanceClient:
             did=agent_did,
             private_key=agent_private_key,
         )
+        workload_private_key = parse_optional_workload_private_key(workload_private_key)
+        self._core_client = core_client
+        self._owns_core_client = core_client is None and workload_private_key is not None
+        if self._owns_core_client:
+            from openbox_core.client import EvaluationClient
+            from openbox_core.identity import AgentIdentity
+
+            self._core_client = EvaluationClient(
+                self._api_url,
+                self._api_key,
+                timeout_seconds=timeout,
+                on_api_error=on_api_error,
+                identity=(
+                    AgentIdentity.from_private_key(
+                        self._agent_identity.did, self._agent_identity.private_key
+                    )
+                    if self._agent_identity
+                    else None
+                ),
+                workload_private_key=workload_private_key,
+                sdk_version=_SDK_PACKAGE_VERSION,
+                sdk_engine="langgraph",
+            )
         # Optional base-SDK gate. When wired (by the handler, from a core
         # runtime built off the SAME api_url/api_key/timeout/on_api_error),
         # `evaluate_event`'s ASYNC path routes lifecycle events through it
         # instead of this client's own httpx transport — see `evaluate_event`.
         # `None` (the default) preserves the exact legacy transport/serialization
         # for every existing caller that constructs a bare `GovernanceClient()`.
-        # `evaluate_event_sync` (sync middleware hooks) is unaffected either way.
+        # The handler also lends its runtime client for sync/raw calls and
+        # approval polling, so every path shares the same workload token cache.
         self._gate = gate
         # Deduplication: prevent sending the same (activity_id, event_type) twice
         # within the same workflow run. Keyed by (workflow_id, run_id) so it resets
@@ -234,7 +270,9 @@ class GovernanceClient:
         return self._sync_client
 
     async def close(self) -> None:
-        """Close the underlying HTTP clients."""
+        """Close owned HTTP clients; a borrowed runtime client belongs to its runtime."""
+        if self._owns_core_client and self._core_client is not None:
+            await self._core_client.aclose()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
         self._client = None
@@ -254,6 +292,13 @@ class GovernanceClient:
             OpenBoxNetworkError: If the server is unreachable.
         """
         from openbox_langgraph.errors import OpenBoxAuthError
+
+        if self._core_client is not None:
+            try:
+                await self._core_client.avalidate_api_key()
+            except _CoreOpenBoxConfigError as exc:
+                _raise_core_error(exc)
+            return
 
         try:
             client = self._get_client()
@@ -341,12 +386,24 @@ class GovernanceClient:
             )
 
         if self._gate is not None:
-            return await _gate_evaluate(self._gate, event, self._on_api_error)
+            try:
+                return await _gate_evaluate(self._gate, event, self._on_api_error)
+            except OpenBoxError:
+                self._forget_failed_event(event, server_event_type)
+                raise
 
         payload = event.to_dict()
         payload["event_type"] = server_event_type
         payload["task_queue"] = event.task_queue or "langgraph"
         payload["source"] = "workflow-telemetry"
+
+        if self._core_client is not None:
+            try:
+                result = await self._core_client.aevaluate(payload)
+            except (_CoreOpenBoxConfigError, _CoreGovernanceAPIError) as exc:
+                self._forget_failed_event(event, server_event_type)
+                _raise_core_error(exc)
+            return _collapse_client_synthesized_fallback(result)
 
         try:
             client = self._get_client()
@@ -372,9 +429,7 @@ class GovernanceClient:
         except OpenBoxNetworkError:
             raise
         except Exception as e:
-            return _network_fallback_result(
-                self._on_api_error, f"Governance API unreachable: {e}"
-            )
+            return _network_fallback_result(self._on_api_error, f"Governance API unreachable: {e}")
 
     def evaluate_event_sync(
         self, event: LangChainGovernanceEvent
@@ -394,6 +449,14 @@ class GovernanceClient:
         payload["event_type"] = server_event_type
         payload["task_queue"] = event.task_queue or "langgraph"
         payload["source"] = "workflow-telemetry"
+
+        if self._core_client is not None:
+            try:
+                result = self._core_client.evaluate(payload)
+            except (_CoreOpenBoxConfigError, _CoreGovernanceAPIError) as exc:
+                self._forget_failed_event(event, server_event_type)
+                _raise_core_error(exc)
+            return _collapse_client_synthesized_fallback(result)
 
         if os.environ.get("OPENBOX_DEBUG") == "1":
             import json
@@ -427,18 +490,26 @@ class GovernanceClient:
         except OpenBoxNetworkError:
             raise
         except Exception as e:
-            return _network_fallback_result(
-                self._on_api_error, f"Governance API unreachable: {e}"
-            )
+            return _network_fallback_result(self._on_api_error, f"Governance API unreachable: {e}")
 
     async def poll_approval(self, params: ApprovalPollParams) -> ApprovalResponse | None:
         """Poll for HITL approval status.
 
-        Returns `None` on network failure so the caller can retry.
+        Returns `None` on ordinary polling transport failure so the caller can retry.
+        Workload authentication and bootstrap failures always raise.
 
         Args:
             params: Identifiers for the pending approval.
         """
+        if self._core_client is not None:
+            try:
+                result = await self._core_client.apoll_approval(
+                    params.workflow_id, params.run_id, params.activity_id
+                )
+            except _CoreOpenBoxConfigError as exc:
+                _raise_core_error(exc)
+            return ApprovalResponse.from_result(result) if result is not None else None
+
         try:
             client = self._get_client()
             body = _json_body(
@@ -482,8 +553,17 @@ class GovernanceClient:
         by the caller (no event_type translation needed).
 
         Args:
-            payload: The raw dict to POST to `/api/v1/governance/evaluate`.
+            payload: The raw dict to POST to the identity-appropriate evaluate route.
         """
+        if self._core_client is not None:
+            try:
+                result = await self._core_client.aevaluate(payload)
+            except (_CoreOpenBoxConfigError, _CoreGovernanceAPIError) as exc:
+                _raise_core_error(exc)
+            if _collapse_client_synthesized_fallback(result) is None:
+                return None
+            return dict(result.raw)
+
         if os.environ.get("OPENBOX_DEBUG") == "1":
             import json
 
@@ -534,6 +614,11 @@ class GovernanceClient:
     # ─────────────────────────────────────────────────────────────
     # Private helpers
     # ─────────────────────────────────────────────────────────────
+
+    def _forget_failed_event(self, event: LangChainGovernanceEvent, event_type: str) -> None:
+        """A caller retrying a rejected event must authenticate again, never dedup to ALLOW."""
+        if event.activity_id and self._dedup_run == (event.workflow_id, event.run_id):
+            self._dedup_sent.discard((event.activity_id, event_type))
 
     def _headers(self, *, method: str, pathname: str, body: bytes | str | None) -> dict[str, str]:
         return build_auth_headers(

@@ -19,6 +19,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from openbox_core.errors import OpenBoxConfigError as _CoreOpenBoxConfigError
 from openbox_langchain import (
     ActivityBridge,
     OpenBoxLangChainCoreAsyncCallbackHandler,
@@ -45,6 +46,7 @@ from openbox_langgraph.errors import (
     GovernanceBlockedError,
     GovernanceHaltError,
     GuardrailsValidationError,
+    _raise_core_error,
 )
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
 from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope, turn_metadata
@@ -388,6 +390,7 @@ class OpenBoxLangGraphHandler:
                 governance_timeout=gc.governance_timeout,
                 agent_did=gc.agent_did,
                 agent_private_key=gc.agent_private_key,
+                workload_private_key=gc.workload_private_key,
                 extra_ignored_urls={gc.api_url} if gc.api_url else None,
             )
             self._client = GovernanceClient(
@@ -398,6 +401,7 @@ class OpenBoxLangGraphHandler:
                 agent_did=gc.agent_did,
                 agent_private_key=gc.agent_private_key,
                 gate=self._core_runtime.gate,
+                core_client=self._core_runtime.client,
             )
             # C1 — install condition == prepare condition: the pure-LangChain-Core
             # callback (installed per-turn in `_governed_config`) is only ever
@@ -921,6 +925,8 @@ class OpenBoxLangGraphHandler:
             _logger.info("[OpenBox] Approval granted, retrying ainvoke")
             self._reset_after_approval(workflow_id)
             final_output = await self._graph.ainvoke(input, config=cfg, **kwargs)
+        except _CoreOpenBoxConfigError as exc:
+            _raise_core_error(exc)
         except Exception as exc:
             hook_err = _extract_governance_blocked(exc)
             if hook_err is None or hook_err.verdict != "require_approval":
@@ -1006,6 +1012,8 @@ class OpenBoxLangGraphHandler:
                     pre_screen_claim=pre_screen_claim,
                 )
                 yield event
+        except _CoreOpenBoxConfigError as exc:
+            _raise_core_error(exc)
         finally:
             # Outermost `finally` on an async generator fires on normal
             # exhaustion, an exception raised through the loop, OR the
@@ -1094,6 +1102,8 @@ class OpenBoxLangGraphHandler:
                     workflow_started_sent=workflow_started_sent,
                 )
                 yield event
+        except _CoreOpenBoxConfigError as exc:
+            _raise_core_error(exc)
         finally:
             # See astream_governed's identical finally for why this covers
             # normal exhaustion, mid-stream exceptions, AND an abandoned
@@ -1981,6 +1991,7 @@ def create_openbox_graph_handler(
     sqlalchemy_engine: Any = None,
     agent_did: str | None = None,
     agent_private_key: str | None = None,
+    workload_private_key: str | None = None,
     **handler_kwargs: Any,
 ) -> OpenBoxLangGraphHandler:
     """Create a fully configured `OpenBoxLangGraphHandler` wrapping a compiled LangGraph graph.
@@ -2000,6 +2011,8 @@ def create_openbox_graph_handler(
         agent_did: Optional OpenBox agent DID. Falls back to `OPENBOX_AGENT_DID`.
         agent_private_key: Optional raw Ed25519 private key seed. Falls back to
             `OPENBOX_AGENT_PRIVATE_KEY`.
+        workload_private_key: PKCS8 PEM RSA key for IAM v3. Falls back to
+            `OPENBOX_LANGGRAPH_WORKLOAD_PRIVATE_KEY`, then `OPENBOX_WORKLOAD_PRIVATE_KEY`.
         **handler_kwargs: Additional keyword arguments forwarded to
             `OpenBoxLangGraphHandlerOptions`.
 
@@ -2023,6 +2036,7 @@ def create_openbox_graph_handler(
         validate=validate,
         agent_did=agent_did,
         agent_private_key=agent_private_key,
+        workload_private_key=workload_private_key,
     )
 
     options = OpenBoxLangGraphHandlerOptions(
