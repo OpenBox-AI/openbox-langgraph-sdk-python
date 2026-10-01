@@ -138,7 +138,7 @@ That's it. Your agent now sends governance events to OpenBox on every tool call,
 
 ### IAM v3 workload identity
 
-IAM v3 is provided by `openbox-sdk-python>=1.3.1`. The existing
+IAM v3 is provided by `openbox-sdk-python>=1.4.0`. The existing
 `openbox-langchain-sdk-python` dependency remains at `>=1.0.0`; its callbacks
 use the same base runtime as the LangGraph handler and operation hooks.
 
