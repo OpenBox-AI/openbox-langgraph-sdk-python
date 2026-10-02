@@ -6,9 +6,8 @@ Each entry point wraps its stream loop in `try/finally` calling
 `activity_context_binding.register_activity` wrote during the turn AND any
 abort marks registered against that turn's `workflow_id` on the base
 `ContextStore`. This must hold on: normal completion, a mid-stream exception,
-an abandoned/early-closed generator, and (for `ainvoke` specifically) AFTER an
-approved hook-approval retry completes — never before, since the retry keeps
-using the pre-screen's identifiers and cleanup must not race it.
+an abandoned/early-closed generator, and an unhandled approval exception.
+An unhandled error must never cause the graph to replay.
 """
 
 from __future__ import annotations
@@ -133,7 +132,7 @@ async def test_ainvoke_sweeps_trace_bindings_on_normal_completion() -> None:
 async def test_ainvoke_sweeps_on_mid_stream_non_approval_exception() -> None:
     """A node raising a plain (non-GovernanceBlockedError) exception still
     triggers `_cleanup_turn` via the `finally` — cleanup is not conditioned on
-    a specific exception type, unlike the approval-retry `except` branches."""
+    a specific exception type."""
     handler = _build_handler_with_core_runtime()
     handler._graph = _raising_node_graph(RuntimeError("boom"))  # type: ignore[attr-defined]
 
@@ -147,12 +146,8 @@ async def test_ainvoke_sweeps_on_mid_stream_non_approval_exception() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ainvoke_cleanup_runs_once_after_approved_retry_not_before() -> None:
-    """Mirrors test_hook_approval_retry_baseline.py's flaky-node graph, but
-    with a real core runtime wired: `_cleanup_turn` must be called EXACTLY
-    ONCE, and only after the approved retry's `self._graph.ainvoke(...)` call
-    has already returned — proving the `finally` sits at the outermost level
-    of the `try/except/except/finally`, not inside either `except` block."""
+async def test_ainvoke_does_not_replay_an_unhandled_pending_error() -> None:
+    """A custom node's pending error cannot safely resume by restarting the graph."""
     handler = _build_handler_with_core_runtime()
     call_count = {"n": 0}
     cleanup_calls: list[int] = []  # snapshot of call_count["n"] at each cleanup call
@@ -182,17 +177,15 @@ async def test_ainvoke_cleanup_runs_once_after_approved_retry_not_before() -> No
         ) as mock_poll,
         patch.object(handler, "_cleanup_turn", side_effect=_spy_cleanup),
     ):
-        result = await handler.ainvoke(
-            {"messages": [HumanMessage(content="hi")]},
-            config={"configurable": {"thread_id": "cleanup-thread-3"}},
-        )
+        with pytest.raises(GovernanceBlockedError):
+            await handler.ainvoke(
+                {"messages": [HumanMessage(content="hi")]},
+                config={"configurable": {"thread_id": "cleanup-thread-3"}},
+            )
 
-    mock_poll.assert_awaited_once()
-    assert call_count["n"] == 2, "expected one blocked pass + one retry"
-    assert result["messages"][-1].content == "succeeded on retry"
-    # Exactly one cleanup call, and it happened AFTER the retry's node ran
-    # (call_count was already 2 by the time cleanup fired).
-    assert cleanup_calls == [2]
+    mock_poll.assert_not_awaited()
+    assert call_count["n"] == 1
+    assert cleanup_calls == [1]
     assert _registry_trace_count(handler) == 0
 
 
