@@ -54,7 +54,7 @@ from openbox_langgraph.trace_context_registry import (
 CORE_ENV_PREFIX = "OPENBOX_LANGGRAPH"
 SDK_ENGINE = "langgraph"
 SDK_LANGUAGE = "python"
-SDK_PACKAGE_VERSION = "1.1.0"
+SDK_PACKAGE_VERSION = "1.2.0"
 
 __all__ = [
     "CORE_ENV_PREFIX",

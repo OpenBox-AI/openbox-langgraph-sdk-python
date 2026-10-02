@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
 - Resume approved tools and operation hooks in place, preserving their activity IDs
   and graph state instead of replaying the entire graph from its original input.

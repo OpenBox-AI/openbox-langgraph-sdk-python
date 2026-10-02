@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from openbox_core.client import EvaluationClient
     from openbox_core.gate import GovernanceGate
 
-_SDK_PACKAGE_VERSION = "1.1.0"
+_SDK_PACKAGE_VERSION = "1.2.0"
 _SDK_IDENTIFIER = f"openbox-langgraph-python-v{_SDK_PACKAGE_VERSION}"
 
 
