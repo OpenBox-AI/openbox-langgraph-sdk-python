@@ -160,7 +160,7 @@ def test_startup_performs_v3_handshake_and_closes_client(
     assert form["grant_type"] == ["client_credentials"]
     assert "client_assertion" in form
     assert validate.headers[TOKEN_HEADER] == "test-workload-token"
-    assert validate.headers["X-OpenBox-SDK-Version"] == "openbox-langgraph-python-v1.1.0"
+    assert validate.headers["X-OpenBox-SDK-Version"] == "openbox-langgraph-python-v1.2.0"
     assert workload_key not in repr(get_global_config())
     assert all(client._sync_client is None for client in wire.clients)
 
