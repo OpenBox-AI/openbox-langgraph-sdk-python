@@ -1,24 +1,8 @@
 # openbox_langgraph/core_adapter.py
-"""LangGraph ``FrameworkAdapter`` for the opt-in ``openbox_core`` hook runtime.
+"""Map base-SDK verdicts to native errors and wait at pending operations.
 
-Maps base-SDK governance verdicts onto the LangGraph-native error types
-(``openbox_langgraph.errors.GovernanceBlockedError``/``GovernanceHaltError``)
-the handler's existing ``ainvoke``/``astream_governed`` catch blocks already
-understand — no new error vocabulary, no new control flow at the call site.
-
-RAISE-ONLY approval, mirroring the legacy hook path exactly: an inline
-blocking poller on the event-loop thread (``time.sleep`` in
-``ApprovalPoller.wait_for_decision``) would freeze every other coroutine on
-that loop — LangGraph tools/LLM calls run as concurrent ``asyncio.Task``s, so
-blocking the loop thread blocks ALL of them, not just the approval-pending
-one. The handler's OUTER catch/poll/retry in ``ainvoke``/``_pre_screen_input``
-is the single HITL driver today (catches ``GovernanceBlockedError`` with
-``verdict == "require_approval"``, awaits ``poll_until_decision``, retries);
-this adapter reproduces that same shape for hook-level (started-stage
-HTTP/DB/file/function) verdicts so the SAME outer loop drives them too.
-Defining ``handle_approval_sync`` here also pre-empts
-``openbox_core.hooks.preflight.HookRuntime._sync_approval``'s fallback to its
-own inline ``ApprovalPoller`` (adapter-native flow always wins when present).
+A handler configures an activity waiter for each governed turn. Standalone
+adapters without a waiter still raise REQUIRE_APPROVAL to fail closed.
 """
 
 from __future__ import annotations
@@ -29,6 +13,7 @@ from openbox_core.context import ContextStore
 from openbox_core.contracts.context import ActivityContext
 from openbox_core.contracts.results import EvaluationResult, Verdict
 
+from openbox_langgraph.activity_approval import ActivityApprovalWaiter
 from openbox_langgraph.errors import GovernanceBlockedError, GovernanceHaltError
 
 __all__ = ["LangGraphFrameworkAdapter"]
@@ -53,6 +38,7 @@ class LangGraphFrameworkAdapter:
         context_store: ContextStore | None = None,
     ) -> None:
         self._store = context_store if context_store is not None else ContextStore()
+        self.approval_waiter: ActivityApprovalWaiter | None = None
 
     # ── Lifecycle verdicts (WorkflowStarted/LLMStarted pre-screen, etc.) ───
 
@@ -90,43 +76,33 @@ class LangGraphFrameworkAdapter:
         reason = result.reason or "Blocked by governance"
         raise GovernanceBlockedError(result.verdict.value, reason, identifier)
 
-    # ── Approval (RAISE-ONLY — never an inline blocking wait) ──────────────
+    # ── Approval: resume the same operation after its decision ────────────
 
     async def handle_approval(
         self, result: EvaluationResult, context: ActivityContext | None = None
     ) -> None:
-        """Async started-hook REQUIRE_APPROVAL -> raise, never await inline.
-
-        The base ``HookRuntime._adecide_started`` treats a normal RETURN as
-        "approved, proceed" — raising here is the correct "not approved yet"
-        signal for a ``requires_approval()`` verdict, so the handler's outer
-        catch/poll/retry loop drives the approval flow.
-        """
+        """Suspend this coroutine without unwinding the graph or blocking the loop."""
         ctx = context if context is not None else self._store.current_activity_context()
-        self._raise_pending_approval(result, ctx)
+        if self.approval_waiter is None or ctx is None:
+            self._raise_pending_approval(result, ctx)
+        try:
+            await self.approval_waiter.wait(result, ctx)
+        except Exception:
+            self._store.mark_activity_aborted(ctx.workflow_id, ctx.activity_id)
+            raise
 
     def handle_approval_sync(
         self, result: EvaluationResult, *, context: ActivityContext | None = None
     ) -> None:
-        """Sync started-hook REQUIRE_APPROVAL -> raise, never poll inline.
-
-        ``context`` is the span-resolved ``ActivityContext``
-        ``HookRuntime._sync_approval`` passes explicitly — it can differ from
-        the ambient ``ContextStore.current_activity_context()`` (e.g. a sync
-        tool running inside ``run_in_executor``, where the ContextVar bound on
-        the async stream-consumer never reached the worker thread). Preferring
-        the passed context over the ambient lookup keeps the abort-mark keyed
-        on the SAME workflow/activity id the operation is actually running
-        under.
-
-        Defining this method is what stops
-        ``HookRuntime._sync_approval`` from falling back to its own inline
-        ``ApprovalPoller.wait_for_decision`` (a blocking ``time.sleep`` loop on
-        whatever thread called this) — an adapter-native
-        ``handle_approval_sync`` always takes priority when present.
-        """
+        """Suspend the sync tool's worker thread, preserving its current stack."""
         ctx = context if context is not None else self._store.current_activity_context()
-        self._raise_pending_approval(result, ctx)
+        if self.approval_waiter is None or ctx is None:
+            self._raise_pending_approval(result, ctx)
+        try:
+            self.approval_waiter.wait_sync(result, ctx)
+        except Exception:
+            self._store.mark_activity_aborted(ctx.workflow_id, ctx.activity_id)
+            raise
 
     def _raise_pending_approval(
         self, result: EvaluationResult, ctx: ActivityContext | None
@@ -151,36 +127,12 @@ class LangGraphFrameworkAdapter:
         adapter's ``on_completed_hook_result``, which is also a no-op)."""
         return None
 
-    # ── Post-approval reset (clears the base store before the retry) ───────
+    # ── Compatibility helper for callers managing abort marks themselves ──
 
     def reset_after_approval(self, workflow_id: str | None) -> None:
-        """Clear every abort mark registered under ``workflow_id`` on the base
-        store, so the caller's retry (already GRANTED by
-        ``poll_until_decision``) runs GOVERNED instead of short-circuiting on
-        a stale abort flag from the blocked first pass.
+        """Clear a workflow's abort marks for legacy callers.
 
-        Scoped to ``workflow_id`` (the per-TURN id), not a single
-        ``activity_id``: an approved retry re-invokes the underlying graph
-        directly (bypassing this SDK's own registration), so the exact
-        ``activity_id`` its operations will use is not knowable up front — but
-        every activity a hook could have aborted THIS turn shares the SAME
-        ``workflow_id``. See ``TraceContextRegistry.clear_aborted_for_workflow``
-        for why the store needed a new, narrower-than-``sweep`` method for this
-        (``sweep`` also drops trace state the retry still needs).
-
-        Call this AFTER ``poll_until_decision`` resolves and BEFORE
-        re-invoking the graph — never before the poll (that would let a
-        second concurrent hook evaluation ignore the still-pending approval).
-
-        Clears the base store — via the ``TraceContextRegistry`` published on
-        the store as ``store.registry`` (``create_core_runtime`` sets it to the
-        runtime's registry; duck-typed by attribute, not import, to avoid a
-        circular import), which sweeps every activity key registered this turn.
-        Falls back to a direct ``clear_activity_aborted`` on the ambient bound
-        context when no registry is published (a store built outside
-        ``create_core_runtime``).
-
-        No-op when ``workflow_id`` is falsy (nothing is ever keyed on it).
+        Normal governed turns wait in place and do not use this helper.
         """
         if not workflow_id:
             return

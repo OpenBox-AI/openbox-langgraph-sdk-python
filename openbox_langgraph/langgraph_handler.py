@@ -30,6 +30,7 @@ from openbox_langchain.activity_bridge import EventType
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 
+from openbox_langgraph.activity_approval import ActivityApprovalWaiter
 from openbox_langgraph.activity_context_binding import (
     build_activity_context,
     register_activity,
@@ -38,6 +39,7 @@ from openbox_langgraph.activity_context_binding import (
 )
 from openbox_langgraph.client import GovernanceClient
 from openbox_langgraph.config import get_global_config, merge_config
+from openbox_langgraph.core_adapter import LangGraphFrameworkAdapter
 from openbox_langgraph.core_runtime import create_core_runtime, get_trace_registry
 from openbox_langgraph.errors import (
     ApprovalExpiredError,
@@ -65,53 +67,6 @@ from openbox_langgraph.verdict_handler import (
 _logger = logging.getLogger(__name__)
 
 _otel_tracer = otel_trace.get_tracer("openbox-langgraph")
-
-
-def _extract_governance_blocked(exc: Exception) -> GovernanceBlockedError | None:
-    """Walk exception chain to find a wrapped GovernanceBlockedError.
-
-    LLM SDKs (OpenAI, Anthropic) wrap httpx errors. When an OTel hook raises
-    GovernanceBlockedError inside httpx, the LLM SDK wraps it as APIConnectionError.
-    This function unwraps the chain via __cause__ / __context__ to recover it.
-    """
-    cause: BaseException | None = exc
-    seen: set[int] = set()
-    while cause is not None:
-        if id(cause) in seen:
-            break
-        seen.add(id(cause))
-        if isinstance(cause, GovernanceBlockedError):
-            return cause
-        cause = getattr(cause, '__cause__', None) or getattr(cause, '__context__', None)
-    return None
-
-
-def _approval_poll_activity_id(hook_err: GovernanceBlockedError, run_id: str) -> str:
-    """Resolve the activity id `ainvoke`'s outer HITL poll should use (C5).
-
-    Core matches a pending approval on `(workflow_id, run_id, activity_id)`
-    exactly (`GovernanceClient.poll_approval` / `ApprovalPollParams` — no
-    other identifying field travels in that request), so polling the WRONG
-    activity_id never resolves and `poll_until_decision`'s unbounded `while
-    True` loop hangs forever.
-
-    A REQUIRE_APPROVAL raised by the pure-LangChain-Core tool callback
-    (installed under the C1 condition) carries the tool's REAL activity_id in
-    `.identifier` — set by `LangGraphFrameworkAdapter._raise_pending_approval`
-    from `current_activity_context()`, which resolves correctly here because
-    `run_inline=True` means the callback raises INSIDE the ToolNode's
-    `activity_scope(ctx, store=store)` (see `tool_activity_binding.py`). Use
-    it verbatim so the poll targets the SAME row the tool's ActivityStarted
-    opened — mirroring the pre-existing tool_start/tool_end HITL poll in
-    `_process_event`, which has always polled the tool's own activity_id
-    rather than a synthetic hook id.
-
-    Falls back to the legacy synthetic `f"{run_id}-hook"` id when no
-    identifier is carried (the base-hook — HTTP/DB/file/function preflight —
-    REQUIRE_APPROVAL path this `except` block already handled before this
-    phase; those raises carry no tool activity_id and are unaffected).
-    """
-    return hook_err.identifier or f"{run_id}-hook"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -360,6 +315,7 @@ class OpenBoxLangGraphHandler:
         # below. `None` here means "no callback, no bridge, consumer governs
         # every tool event unconditionally", matching today's behavior exactly.
         self._activity_bridge: ActivityBridge | None = None
+        self._activity_approvals: ActivityApprovalWaiter | None = None
 
         if opts.client:
             # Injected client (e.g. a test double, or a subclass overriding
@@ -607,9 +563,8 @@ class OpenBoxLangGraphHandler:
         No-op when the handler has no core runtime (`_core_runtime is None` —
         injected-client handlers, legacy-only). Every public entry point calls
         this from the OUTERMOST `finally` of its stream loop so it runs
-        exactly once per turn regardless of success, mid-stream exception, or
-        (for `ainvoke`) an approved hook-approval retry — see the `finally`
-        placement in each entry point for why ordering after the retry matters.
+        exactly once per turn regardless of success, mid-stream exception,
+        approval rejection, or cancellation while waiting for approval.
         Stays SYNCHRONOUS (existing tests spy/patch it with a plain callable
         called without `await`) — the C6 orphan-close below uses the base
         SDK's SYNC gate for the same reason.
@@ -635,18 +590,12 @@ class OpenBoxLangGraphHandler:
         above never sees that key) — clear those directly on the runtime's
         store so they cannot leak for the handler's lifetime.
 
-        The abort-mark clear runs UNCONDITIONALLY for every swept tool record
-        (not gated on `record.abort_marked`): a REQUIRE_APPROVAL raised by the
-        callback can propagate through ANY entry point (`ainvoke` polls and
-        retries it; `astream_governed`/`astream`/`astream_events` have no
-        catch/poll loop at all — pre-existing, HITL retry is `ainvoke`-only —
-        and simply propagate it to the caller), so a per-entry-point catch
-        site is not a reliable place to set the flag. `clear_activity_aborted`
-        is an idempotent set-discard — a no-op for a record that was never
-        actually aborted — so clearing unconditionally is always safe.
-        `record.abort_marked` is still set (see `_mark_bridge_abort`) and
-        checked here as a fast-path/diagnostic signal, not a gate.
+        Clear abort marks for every swept tool record: terminal governance
+        failures can escape through any entry point, including wrapped errors.
+        Clearing is idempotent for activities that were never aborted.
         """
+        if self._activity_approvals is not None:
+            self._activity_approvals.end_turn(workflow_id)
         if self._core_runtime is None:
             return
         get_trace_registry(self._core_runtime).sweep(workflow_id)
@@ -662,27 +611,6 @@ class OpenBoxLangGraphHandler:
                     record.activity_id,
                 )
                 self._close_orphan_bridge_tool(workflow_id, record)
-
-    def _mark_bridge_abort(self, workflow_id: str, activity_id: str) -> None:
-        """Record (M19) that the base store's abort mark for `activity_id` was
-        set via the ToolNode-seam ContextVar path, NOT `register_activity` —
-        so `_cleanup_turn`'s `TraceContextRegistry.sweep` (which only clears
-        keys it registered) will never see it, and the mark would otherwise
-        leak on the runtime's `ContextStore` for the handler's lifetime.
-
-        No-op when this turn has no bridge (consumer-governed path — the
-        adapter's OWN abort-mark clearing there is exactly what `sweep`
-        already covers, via `register_activity`'s trace-only dual-write).
-        Safe to call with an activity_id the bridge never prepared (e.g. the
-        legacy synthetic `f"{run_id}-hook"` id from a base-hook approval,
-        C5's fallback branch) — `ActivityBridge.get` returns None and this is
-        a no-op, exactly matching pre-phase-4 behavior for that path.
-        """
-        if self._activity_bridge is None:
-            return
-        record = self._activity_bridge.get(workflow_id, activity_id)
-        if record is not None:
-            record.abort_marked = True
 
     def _close_orphan_bridge_tool(self, workflow_id: str, record: Any) -> None:
         """Best-effort failed ActivityCompleted for a swept orphan tool row.
@@ -713,27 +641,6 @@ class OpenBoxLangGraphHandler:
                 record.activity_id,
                 exc_info=True,
             )
-
-    def _reset_after_approval(self, workflow_id: str) -> None:
-        """Clear the abort mark(s) a hook set for this turn BEFORE an approved
-        REQUIRE_APPROVAL retry re-invokes the graph, so the retry runs
-        GOVERNED instead of short-circuiting on the stale abort flag the
-        blocked first pass left behind.
-
-        No-op when the handler has no core runtime (`_core_runtime is None`)
-        OR the runtime's adapter is the base default `CoreAdapter` (only
-        reachable when `use_core_instrumentation=False` — that adapter has no
-        `reset_after_approval`, matching this turn never having armed base
-        instrumentation in the first place, so there is nothing to reset).
-        Call BEFORE re-invoking the graph, AFTER `poll_until_decision`
-        resolves — matches `LangGraphFrameworkAdapter.reset_after_approval`'s
-        own ordering contract.
-        """
-        if self._core_runtime is None:
-            return
-        reset = getattr(self._core_runtime.adapter, "reset_after_approval", None)
-        if reset is not None:
-            reset(workflow_id)
 
     def _governed_config(
         self,
@@ -782,6 +689,15 @@ class OpenBoxLangGraphHandler:
         untouched by this phase — see ``_process_event``'s LLMCompleted
         fallback branch.
         """
+        if self._core_runtime is not None and isinstance(
+            self._core_runtime.adapter, LangGraphFrameworkAdapter
+        ):
+            if self._activity_approvals is None:
+                self._activity_approvals = ActivityApprovalWaiter(
+                    self._core_runtime.client, self._config.hitl
+                )
+                self._core_runtime.adapter.approval_waiter = self._activity_approvals
+            self._activity_approvals.begin_turn(workflow_id, run_id)
         callbacks: list[Any] = []
         if self._activity_bridge is not None and self._core_runtime is not None:
             registry = get_trace_registry(self._core_runtime)
@@ -906,53 +822,10 @@ class OpenBoxLangGraphHandler:
                     output = stream_event.data.get("output")
                     if isinstance(output, dict):
                         final_output = output
-        except GovernanceBlockedError as hook_err:
-            if hook_err.verdict != "require_approval":
-                raise
-            _logger.info("[OpenBox] Hook REQUIRE_APPROVAL during ainvoke, polling")
-            poll_activity_id = _approval_poll_activity_id(hook_err, run_id)
-            self._mark_bridge_abort(workflow_id, poll_activity_id)
-            await poll_until_decision(
-                self._client,
-                HITLPollParams(
-                    workflow_id=workflow_id,
-                    run_id=run_id,
-                    activity_id=poll_activity_id,
-                    activity_type="hook",
-                ),
-                self._config.hitl,
-            )
-            _logger.info("[OpenBox] Approval granted, retrying ainvoke")
-            self._reset_after_approval(workflow_id)
-            final_output = await self._graph.ainvoke(input, config=cfg, **kwargs)
         except _CoreOpenBoxConfigError as exc:
             _raise_core_error(exc)
-        except Exception as exc:
-            hook_err = _extract_governance_blocked(exc)
-            if hook_err is None or hook_err.verdict != "require_approval":
-                raise
-            _logger.info("[OpenBox] Hook REQUIRE_APPROVAL (wrapped) during ainvoke, polling")
-            poll_activity_id = _approval_poll_activity_id(hook_err, run_id)
-            self._mark_bridge_abort(workflow_id, poll_activity_id)
-            await poll_until_decision(
-                self._client,
-                HITLPollParams(
-                    workflow_id=workflow_id,
-                    run_id=run_id,
-                    activity_id=poll_activity_id,
-                    activity_type="hook",
-                ),
-                self._config.hitl,
-            )
-            _logger.info("[OpenBox] Approval granted, retrying ainvoke")
-            self._reset_after_approval(workflow_id)
-            final_output = await self._graph.ainvoke(input, config=cfg, **kwargs)
         finally:
-            # Outermost `finally` on purpose: an approval retry re-runs the
-            # graph INSIDE the `except` blocks above, so this only fires once
-            # the (possibly retried) turn is fully done — the retry keeps its
-            # dual-write context intact instead of racing a cleanup that
-            # unregisters it mid-retry. See `_cleanup_turn`.
+            # Pending activities wait in place; the graph is never replayed.
             self._cleanup_turn(workflow_id)
 
         return final_output

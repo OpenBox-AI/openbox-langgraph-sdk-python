@@ -331,7 +331,17 @@ governed = create_openbox_graph_handler(
 )
 ```
 
-The human approves or rejects from the OpenBox dashboard. The SDK resumes or raises `ApprovalRejectedError` accordingly.
+The human approves or rejects from the OpenBox dashboard. Approval resumes the
+pending tool or hook operation with the same activity ID and graph state. Completed
+nodes and earlier tool side effects are not replayed. Later approval requests wait
+independently, including through `astream_governed` and `astream_events`. Rejection
+raises `ApprovalRejectedError`; expiration raises `ApprovalExpiredError`.
+
+Async operations await the decision without blocking the event loop. Synchronous
+tools wait in their executor thread. A synchronous operation called directly on the
+event-loop thread cannot safely suspend its stack, so pending approval raises
+`OpenBoxConfigError`; use an async operation or `asyncio.to_thread()` in that case.
+Cancelling the governed turn also stops pending approval waits.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

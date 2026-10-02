@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Resume approved tools and operation hooks in place, preserving their activity IDs
+  and graph state instead of replaying the entire graph from its original input.
+- Handle repeated approval requests through invocation and streaming entry points.
+  Share each decision between sync and async callbacks for the same evaluation.
+- Cancel pending sync-tool waits when their turn ends, preventing a late approval
+  from executing an abandoned tool. Fail closed for sync waits on the event loop.
+
 ## 1.1.0
 
 - Upgrade `openbox-sdk-python` to `>=1.4.0` for IAM v3 workload identity. Keep

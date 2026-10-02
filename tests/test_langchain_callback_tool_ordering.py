@@ -21,7 +21,6 @@ pending-approval with bridge + abort-marks cleaned after cleanup.
 from __future__ import annotations
 
 from typing import Annotated, Any, TypedDict
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -38,7 +37,7 @@ from openbox_core.context import ContextStore
 
 from openbox_langgraph.client import GovernanceClient
 from openbox_langgraph.core_adapter import LangGraphFrameworkAdapter
-from openbox_langgraph.errors import GovernanceBlockedError
+from openbox_langgraph.errors import ApprovalRejectedError, GovernanceBlockedError
 from openbox_langgraph.langgraph_handler import (
     OpenBoxLangGraphHandler,
     OpenBoxLangGraphHandlerOptions,
@@ -287,15 +286,7 @@ async def test_block_stops_body_and_failed_completion_closes_row() -> None:
 
 
 async def test_require_approval_polls_the_tools_real_activity_id() -> None:
-    """C5 — the outer `ainvoke` REQUIRE_APPROVAL poll must target the TOOL's
-    REAL activity_id (the canonical id bound at the ToolNode seam), never the
-    generic `f"{run_id}-hook"` synthetic id: Core matches approvals on
-    `(workflow_id, run_id, activity_id)` exactly, so polling the wrong key
-    would hang `poll_until_decision` forever in production."""
-    # ONE leading ALLOW is the agent LLM call's ActivityCompleted (Phase 5 —
-    # see test_block_stops_body_and_failed_completion_closes_row's identical
-    # note) — its START is pre-screen-reused, consuming nothing from this
-    # queue.
+    """Approval polls the existing tool row, then resumes that same tool."""
     fake_core = FakeCore(
         {"verdict": "allow"},
         {"verdict": "require_approval", "approval_id": "app-1"},
@@ -306,21 +297,18 @@ async def test_require_approval_polls_the_tools_real_activity_id() -> None:
 
     with installed_conformance_runtime(fake_core, adapter, store) as runtime:
         handler = _build_handler(graph, runtime)
-        with patch(
-            "openbox_langgraph.langgraph_handler.poll_until_decision",
-            new=AsyncMock(return_value=None),
-        ) as mock_poll:
-            await handler.ainvoke(
-                {"messages": [HumanMessage(content="please run the tool")]},
-                config={"configurable": {"thread_id": "ordering-thread-approval"}},
-            )
+        await handler.ainvoke(
+            {"messages": [HumanMessage(content="please run the tool")]},
+            config={"configurable": {"thread_id": "ordering-thread-approval"}},
+        )
 
-    mock_poll.assert_awaited_once()
-    polled_params = mock_poll.await_args.args[1]
+    assert len(fake_core.approval_requests) == 1
+    polled = fake_core.approval_requests[0]
     started = _lifecycle_payloads(fake_core, "ActivityStarted")
-    assert started
-    assert polled_params.activity_id == started[0]["activity_id"]
-    assert polled_params.activity_id != f"{polled_params.run_id}-hook"
+    assert len(started) == 1
+    assert polled["activity_id"] == started[0]["activity_id"]
+    assert polled["activity_id"] != f"{polled['run_id']}-hook"
+    assert _body_effects == ["hi"]
 
 
 async def test_tool_completed_block_is_enforced_from_stashed_verdict() -> None:
@@ -351,26 +339,11 @@ async def test_tool_completed_block_is_enforced_from_stashed_verdict() -> None:
     assert _body_effects == ["hi"], "the tool body DID run (start was ALLOW)"
 
 
-async def test_streaming_propagates_pending_approval_and_cleans_up() -> None:
-    """Unlike `ainvoke`, `astream_events`/`astream_governed`/`astream` have no
-    outer catch/poll/retry loop (pre-existing — only `ainvoke` drives HITL) —
-    a callback REQUIRE_APPROVAL raise PROPAGATES straight to the caller. The
-    `finally` still runs `_cleanup_turn`, so after the raise the bridge and
-    the store's `_aborted_activities` are both empty — no leaked bridge
-    record or abort mark (M19), even though the turn never resolved."""
-    # ONE leading ALLOW is the agent LLM call's ActivityCompleted (Phase 5) —
-    # its START is pre-screen-reused (`_pre_screen_input` uses the injected
-    # `_AllowEverythingClient`, never the FakeCore-backed gate, so it never
-    # touches this queue), but its COMPLETION makes a real `gate.aevaluate`
-    # call that DOES consume from this FIFO queue before the tool node is
-    # ever reached. REQUIRE_APPROVAL must land on the TOOL's START (which
-    # ENFORCES/raises, per `enforce_tool_start_async`) — NOT its completion
-    # (which only sends telemetry; enforcement of a completion verdict is the
-    # CONSUMER's poll-and-continue job, a different code path that would
-    # actually call `poll_until_decision` instead of propagating a raise).
+async def test_streaming_waits_for_approval_and_cleans_up_after_rejection() -> None:
     fake_core = FakeCore(
         {"verdict": "allow"},
         {"verdict": "require_approval", "approval_id": "app-2"},
+        {"action": "block", "reason": "human rejected"},
     )
     store = ContextStore()
     adapter = LangGraphFrameworkAdapter(context_store=store)
@@ -378,14 +351,15 @@ async def test_streaming_propagates_pending_approval_and_cleans_up() -> None:
 
     with installed_conformance_runtime(fake_core, adapter, store) as runtime:
         handler = _build_handler(graph, runtime)
-        with pytest.raises(GovernanceBlockedError) as exc_info:
+        with pytest.raises(ApprovalRejectedError, match="human rejected"):
             async for _event in handler.astream_events(
                 {"messages": [HumanMessage(content="please run the tool")]},
                 config={"configurable": {"thread_id": "ordering-thread-stream"}},
             ):
                 pass
 
-        assert exc_info.value.verdict == "require_approval"
-        bridge = handler._activity_bridge  # type: ignore[attr-defined]
-        assert bridge._workflows == {}  # type: ignore[attr-defined]
-        assert store._aborted_activities == set()  # type: ignore[attr-defined]
+        assert len(fake_core.approval_requests) == 1
+        assert _body_effects == []
+        bridge = handler._activity_bridge
+        assert bridge._workflows == {}
+        assert store._aborted_activities == set()
