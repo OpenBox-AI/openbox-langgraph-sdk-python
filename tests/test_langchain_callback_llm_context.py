@@ -487,13 +487,13 @@ async def test_error_path_sends_failed_completion_and_unregisters_trace() -> Non
     assert completed[0].get("error") is not None
 
 
-async def test_completion_approval_polls_and_continues_without_graph_replay() -> None:
-    """C4 — a REQUIRE_APPROVAL verdict on LLMCompleted must poll-and-continue
-    IN-LINE inside `_process_event` (never raise `GovernanceBlockedError` out
-    to `ainvoke`'s outer catch/retry) — no graph replay, no re-run of the
-    tool side effects that already happened in the SAME turn."""
-    # Two leading ALLOWs are `_pre_screen_input`'s OWN SignalReceived +
-    # WorkflowStarted sends (same shared FakeCore queue, FIFO — see
+async def test_completion_approval_continues_without_waiting_or_replay() -> None:
+    """A REQUIRE_APPROVAL verdict on LLMCompleted arrives after the call
+    already ran, so it is logged and the turn continues: no approval poll, no
+    `GovernanceBlockedError` out to `ainvoke`'s outer catch/retry, no graph
+    replay of side effects that already happened in the SAME turn."""
+    # Two leading ALLOWs are `_pre_screen_input`'s OWN WorkflowStarted +
+    # SignalReceived sends (same shared FakeCore queue, FIFO — see
     # test_redaction_mutates_pre_call_message's identical note); the THIRD
     # is the LLMStarted pre-screen itself (reused by the callback for call 1,
     # not re-queued); the FOURTH is the callback's LLMCompleted.
@@ -518,13 +518,10 @@ async def test_completion_approval_polls_and_continues_without_graph_replay() ->
                 config={"configurable": {"thread_id": "llm-ctx-completion-approval"}},
             )
 
-    mock_poll.assert_awaited_once()
-    polled_params = mock_poll.await_args.args[1]
-    completed = _llm_payloads(fake_core, "ActivityCompleted")
-    assert completed
-    assert polled_params.activity_id == completed[0]["activity_id"]
-    # The turn completed normally past the poll — proof there was no
-    # graph-replay retry (a replay would re-run `call_model` a second time,
+    mock_poll.assert_not_awaited()
+    assert _llm_payloads(fake_core, "ActivityCompleted")
+    # The turn completed normally — proof there was no graph-replay retry
+    # (a replay would re-run `call_model` a second time,
     # which this single-LLM-call graph has no branching to distinguish, but
     # a second gate call for a 2nd LLMStarted WOULD show up if it had replayed).
     assert result["messages"][-1].content == "hello from fake model"

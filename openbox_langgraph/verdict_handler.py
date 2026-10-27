@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import warnings
 from typing import Literal
@@ -58,17 +59,22 @@ def lang_graph_event_to_context(event_type: str, *, is_root: bool = False) -> Ve
     return mapping.get(event_type, "other")
 
 
+_logger = logging.getLogger(__name__)
+
+# The operation has already run when these are evaluated.
+_COMPLETION_CONTEXTS: frozenset[str] = frozenset({"tool_end", "llm_end"})
+
+
 def is_hitl_applicable(context: VerdictContext) -> bool:
     """Return True if HITL polling applies to this verdict context.
 
-    HITL applies to start events (before execution) and tool/LLM end events,
-    because Behavior Rules on ActivityCompleted can return REQUIRE_APPROVAL.
+    HITL applies only before execution. A REQUIRE_APPROVAL on a completion
+    (``tool_end`` / ``llm_end``) cannot gate an operation that already ran, so
+    it is logged and the run continues — see :func:`enforce_verdict`.
     """
     return context in (
         "tool_start",
-        "tool_end",
         "llm_start",
-        "llm_end",
         "graph_node_start",
         "agent_action",
     )
@@ -188,6 +194,17 @@ def enforce_verdict(
 
     # 4. REQUIRE_APPROVAL
     if verdict_requires_approval(verdict):
+        if context in _COMPLETION_CONTEXTS:
+            # The tool/LLM call already ran; waiting cannot undo it and only
+            # stalls the run. Same behavior as the LangChain and Temporal SDKs.
+            _logger.warning(
+                "REQUIRE_APPROVAL returned after the operation completed (%s); "
+                "continuing without waiting. Match the rule on ActivityStarted "
+                "to gate the operation.%s",
+                context,
+                f" Reason: {reason}" if reason else "",
+            )
+            return VerdictEnforcementResult()
         if is_hitl_applicable(context):
             return VerdictEnforcementResult(requires_hitl=True)
         msg = reason or "Action requires approval but cannot be paused at this stage"

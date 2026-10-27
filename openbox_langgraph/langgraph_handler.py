@@ -416,8 +416,30 @@ class OpenBoxLangGraphHandler:
         caller — so GuardrailsValidationError, GovernanceHaltError, GovernanceBlockedError
         all reach the user's except block and halt the session correctly.
         """
-        # ── 0. SignalReceived — fire before WorkflowStarted so the dashboard shows
-        # the user prompt as the trigger that initiated the session.
+        # ── 0. WorkflowStarted — goes first: Core creates the session from it and
+        # holds every other event for the run (SignalReceived, the pre-screen
+        # ActivityStarted) with SessionNotReady until that session exists.
+        # Gated on send_chain_start_event only, NOT on send_llm_start_event.
+        if self._config.send_chain_start_event:
+            wf_start = LangChainGovernanceEvent(
+                source="workflow-telemetry",
+                event_type="WorkflowStarted",
+                workflow_id=workflow_id,
+                run_id=run_id,
+                workflow_type=self._config.agent_name or "LangGraphRun",
+                task_queue=self._config.task_queue,
+                timestamp=rfc3339_now(),
+                session_id=self._config.session_id,
+                activity_id=f"{run_id}-wf",
+                activity_type=self._config.agent_name or "LangGraphRun",
+                activity_input=[safe_serialize(input)],
+            )
+            await self._client.evaluate_event(wf_start)
+            workflow_started_sent = True
+        else:
+            workflow_started_sent = False
+
+        # ── 1. SignalReceived — the user prompt that triggered the session.
         # Extract the last human message from the input as the signal payload.
         _sig_messages = input.get("messages") or []
         _user_prompt: str | None = None
@@ -446,28 +468,6 @@ class OpenBoxLangGraphHandler:
                 signal_args=[_user_prompt],
             )
             await self._client.evaluate_event(sig_event)
-
-        # ── 1. WorkflowStarted — must precede any ActivityStarted so the dashboard
-        # creates a session to attach the guardrail event to (mirrors both SDKs).
-        # Gated on send_chain_start_event only, NOT on send_llm_start_event.
-        if self._config.send_chain_start_event:
-            wf_start = LangChainGovernanceEvent(
-                source="workflow-telemetry",
-                event_type="WorkflowStarted",
-                workflow_id=workflow_id,
-                run_id=run_id,
-                workflow_type=self._config.agent_name or "LangGraphRun",
-                task_queue=self._config.task_queue,
-                timestamp=rfc3339_now(),
-                session_id=self._config.session_id,
-                activity_id=f"{run_id}-wf",
-                activity_type=self._config.agent_name or "LangGraphRun",
-                activity_input=[safe_serialize(input)],
-            )
-            await self._client.evaluate_event(wf_start)
-            workflow_started_sent = True
-        else:
-            workflow_started_sent = False
 
         # ── 2. LLMStarted pre-screen — enforce guardrails on the user prompt
         if not self._config.send_llm_start_event:
@@ -518,26 +518,29 @@ class OpenBoxLangGraphHandler:
             enforcement_error = exc
             result = None  # type: ignore[assignment]
 
-        if (
-            enforcement_error is not None
-            and workflow_started_sent
-            and self._config.send_chain_end_event
-        ):
-            wf_end = LangChainGovernanceEvent(
-                source="workflow-telemetry",
-                event_type="WorkflowCompleted",
-                workflow_id=workflow_id,
-                run_id=run_id,
-                workflow_type=self._config.agent_name or "LangGraphRun",
-                task_queue=self._config.task_queue,
-                timestamp=rfc3339_now(),
-                session_id=self._config.session_id,
-                activity_id=f"{run_id}-wf",
-                activity_type=self._config.agent_name or "LangGraphRun",
-                status="failed",
-                error=str(enforcement_error),
-            )
-            await self._client.evaluate_event(wf_end)
+        if enforcement_error is not None:
+            if workflow_started_sent and self._config.send_chain_end_event:
+                wf_end = LangChainGovernanceEvent(
+                    source="workflow-telemetry",
+                    event_type="WorkflowCompleted",
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    workflow_type=self._config.agent_name or "LangGraphRun",
+                    task_queue=self._config.task_queue,
+                    timestamp=rfc3339_now(),
+                    session_id=self._config.session_id,
+                    activity_id=f"{run_id}-wf",
+                    activity_type=self._config.agent_name or "LangGraphRun",
+                    status="failed",
+                    error=str(enforcement_error),
+                )
+                # Best effort: a HALT has already closed the session on Core,
+                # which rejects this event — that rejection must not replace
+                # the verdict the caller is owed.
+                try:
+                    await self._client.evaluate_event(wf_end)
+                except Exception:
+                    _logger.debug("closing event after pre-screen stop failed", exc_info=True)
             raise enforcement_error
 
         if result and result.requires_hitl:

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0
+
+- Do not wait on a REQUIRE_APPROVAL returned for a completed tool or LLM call
+  (`tool_end` / `llm_end`). The call already ran, so the approval could not gate
+  it and only stalled the run until someone approved it; it is now logged and
+  the run continues, the same as in the LangChain and Temporal SDKs.
+- Send `WorkflowStarted` before the user-prompt `SignalReceived`. Core creates
+  the session from `WorkflowStarted` and holds any other event for the run until
+  it exists (SessionNotReady), so a signal sent first blocked the run and failed
+  it with HTTP 500.
+- Upgrade `openbox-sdk-python` to `[http]>=1.5.0` for OpenRouter routing
+  provenance on model calls. Refresh the locked LangChain/LangGraph stack.
+- Raise a pre-screen BLOCK/HALT to the caller even when the closing
+  `WorkflowCompleted` is rejected (Core closes a halted session itself and
+  answers 400) or `send_chain_end_event` is off; previously the 400 replaced
+  the verdict, or the pre-screen dropped the stop.
+
 ## 1.2.0
 
 - Resume approved tools and operation hooks in place, preserving their activity IDs

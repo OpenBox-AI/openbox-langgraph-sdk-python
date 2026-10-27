@@ -77,6 +77,26 @@ def test_lang_graph_event_to_context_and_hitl_applicability() -> None:
     assert not is_hitl_applicable("chain_end")
 
 
+@pytest.mark.parametrize("context", ["tool_end", "llm_end"])
+def test_completion_stage_approval_continues_without_waiting(context, caplog) -> None:
+    """The tool/LLM call already ran: no HITL wait, no block — logged instead."""
+    assert not is_hitl_applicable(context)
+    with caplog.at_level("WARNING", logger="openbox_langgraph.verdict_handler"):
+        result = enforce_verdict(
+            GovernanceVerdictResponse(verdict=Verdict.REQUIRE_APPROVAL, reason="review refunds"),
+            context,
+        )
+    assert not result.requires_hitl
+    assert not result.blocked
+    assert "after the operation completed" in caplog.text
+    assert "review refunds" in caplog.text
+
+
+def test_start_stage_approval_still_waits() -> None:
+    response = GovernanceVerdictResponse(verdict=Verdict.REQUIRE_APPROVAL)
+    assert enforce_verdict(response, "tool_start").requires_hitl
+
+
 def test_enforce_verdict_observation_context_ignores_block() -> None:
     result = enforce_verdict(
         GovernanceVerdictResponse(verdict=Verdict.BLOCK, reason="blocked"),
