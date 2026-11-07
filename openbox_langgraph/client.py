@@ -25,6 +25,16 @@ except ImportError:  # openbox-sdk-python before on_behalf_of: nothing to add
         return payload
 
 
+try:
+    from openbox_core.exposure import (  # type: ignore[import-not-found,unused-ignore]
+        apply_exposure as _apply_exposure,
+    )
+except ImportError:  # openbox-sdk-python before exposure fields: nothing to add
+
+    def _apply_exposure(payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
+
+
 from openbox_langgraph.core_events import to_envelope
 from openbox_langgraph.errors import (
     OpenBoxConfigError,
@@ -417,7 +427,7 @@ class GovernanceClient:
 
         try:
             client = self._get_client()
-            body = _json_body(_apply_on_behalf_of(payload))
+            body = _json_body(_apply_exposure(_apply_on_behalf_of(payload)))
             response = await client.post(
                 f"{self._api_url}/api/v1/governance/evaluate",
                 headers=self._headers(
@@ -478,7 +488,7 @@ class GovernanceClient:
 
         try:
             client = self._get_sync_client()
-            body = _json_body(_apply_on_behalf_of(payload))
+            body = _json_body(_apply_exposure(_apply_on_behalf_of(payload)))
             response = client.post(
                 f"{self._api_url}/api/v1/governance/evaluate",
                 headers=self._headers(
@@ -583,7 +593,7 @@ class GovernanceClient:
 
         try:
             client = self._get_client()
-            body = _json_body(_apply_on_behalf_of(payload))
+            body = _json_body(_apply_exposure(_apply_on_behalf_of(payload)))
             response = await client.post(
                 f"{self._api_url}/api/v1/governance/evaluate",
                 headers=self._headers(
