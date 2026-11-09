@@ -57,6 +57,7 @@ from openbox_langgraph.retriever_labels import (
     RetrieverAdmissionCallback,
     exposure_available,
 )
+from openbox_langgraph.run_scope import ScopeResolver, enter_scope, exit_scope, resolve_run_scope
 from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope, turn_metadata
 from openbox_langgraph.types import (
     GovernanceVerdictResponse,
@@ -269,6 +270,17 @@ class OpenBoxLangGraphHandlerOptions:
     label_coverage_log_every: int = 100
     """Log labelled vs unlabelled document counts every N documents (0: never).
     The counts are also on ``handler.label_coverage.snapshot()``."""
+    scope_key: str | None = None
+    """One agent session per matter or tenant (PROD-1109): the run input key
+    holding it, e.g. ``"matter_id"``. Looked up in the input, then in
+    ``config["configurable"]``, then in the thread's saved state. The value
+    becomes ``<namespace>:<value>``; core keeps one exposure history per scope.
+    Unset: each run is its own session."""
+    scope_namespace: str | None = None
+    """Namespace for ``scope_key`` values; defaults to the key without ``_id``
+    (``matter_id`` -> ``matter``)."""
+    scope_resolver: ScopeResolver | None = None
+    """Custom ``(input, config) -> scope``; takes precedence over ``scope_key``."""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -333,6 +345,9 @@ class OpenBoxLangGraphHandler:
         self._label_map: dict[str, str] = dict(opts.label_map or {})
         self._label_uri_keys = tuple(opts.label_uri_keys)
         self.label_coverage = LabelCoverage(opts.label_coverage_log_every)
+        self._scope_key = opts.scope_key
+        self._scope_namespace = opts.scope_namespace
+        self._scope_resolver = opts.scope_resolver
         if self._label_map and not exposure_available():
             _logger.warning(
                 "OpenBox: label_map is set but openbox-sdk-python has no exposure fields; "
@@ -797,7 +812,83 @@ class OpenBoxLangGraphHandler:
     # Public invoke / ainvoke
     # ─────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────
+    # Run scope: one agent session per matter or tenant (PROD-1109)
+    # ─────────────────────────────────────────────────────────────
+
+    async def _enter_run_scope(
+        self, input: Any, config: dict[str, Any] | None
+    ) -> contextlib.ExitStack:
+        scope = await resolve_run_scope(
+            self._graph,
+            input,
+            config,
+            key=self._scope_key,
+            namespace=self._scope_namespace,
+            resolver=self._scope_resolver,
+        )
+        return enter_scope(scope)
+
     async def ainvoke(
+        self,
+        input: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Invoke the governed graph and return the final state.
+
+        Every governance event of the run is scoped to the run's matter or
+        tenant when ``scope_key``/``scope_resolver`` is set.
+        """
+        scope = await self._enter_run_scope(input, config)
+        try:
+            return await self._ainvoke_unscoped(input, config=config, **kwargs)
+        finally:
+            exit_scope(scope)
+
+    async def astream_governed(
+        self,
+        input: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream governed graph events, scoped like :meth:`ainvoke`."""
+        scope = await self._enter_run_scope(input, config)
+        try:
+            inner = cast(
+                "AsyncGenerator[dict[str, Any], None]",
+                self._astream_governed_unscoped(input, config=config, **kwargs),
+            )
+            async with contextlib.aclosing(inner) as events:
+                async for event in events:
+                    yield event
+        finally:
+            exit_scope(scope)
+
+    async def astream_events(
+        self,
+        input: dict[str, Any],
+        config: dict[str, Any] | None = None,
+        *,
+        version: str = "v2",
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Graph-compatible astream_events, scoped like :meth:`ainvoke`."""
+        scope = await self._enter_run_scope(input, config)
+        try:
+            inner = cast(
+                "AsyncGenerator[dict[str, Any], None]",
+                self._astream_events_unscoped(input, config, version=version, **kwargs),
+            )
+            async with contextlib.aclosing(inner) as events:
+                async for event in events:
+                    yield event
+        finally:
+            exit_scope(scope)
+
+    async def _ainvoke_unscoped(
         self,
         input: dict[str, Any],
         *,
@@ -874,7 +965,7 @@ class OpenBoxLangGraphHandler:
 
         return final_output
 
-    async def astream_governed(
+    async def _astream_governed_unscoped(
         self,
         input: dict[str, Any],
         *,
@@ -973,7 +1064,7 @@ class OpenBoxLangGraphHandler:
             async for chunk in inner:
                 yield chunk
 
-    async def astream_events(
+    async def _astream_events_unscoped(
         self,
         input: dict[str, Any],
         config: dict[str, Any] | None = None,
