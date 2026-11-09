@@ -15,7 +15,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -48,8 +48,10 @@ from openbox_langgraph.errors import (
     GovernanceBlockedError,
     GovernanceHaltError,
     GuardrailsValidationError,
+    OpenBoxConfigError,
     _raise_core_error,
 )
+from openbox_langgraph.handoff import HandoffEnvelope, HandoffResult, handoff_scope
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
 from openbox_langgraph.retriever_labels import (
     DEFAULT_URI_KEYS,
@@ -72,6 +74,11 @@ from openbox_langgraph.verdict_handler import (
 )
 
 _logger = logging.getLogger(__name__)
+
+try:
+    from openbox_core import exposure as _exposure_mod  # type: ignore[attr-defined,unused-ignore]
+except ImportError:  # openbox-sdk-python before exposure fields
+    _exposure_mod = None  # type: ignore[assignment,unused-ignore]
 
 _otel_tracer = otel_trace.get_tracer("openbox-langgraph")
 
@@ -887,6 +894,85 @@ class OpenBoxLangGraphHandler:
                     yield event
         finally:
             exit_scope(scope)
+
+    # ─────────────────────────────────────────────────────────────
+    # Receiving a handoff from another governed agent (PROD-1109)
+    # ─────────────────────────────────────────────────────────────
+
+    async def areceive_handoff(
+        self,
+        envelope: Mapping[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        input_from_task: Callable[[str], dict[str, Any]] | None = None,
+        result_from_state: Callable[[dict[str, Any]], str] | None = None,
+    ) -> dict[str, Any]:
+        """Run this graph on a task another governed agent handed over.
+
+        1. Records the handoff with Core (``Handoff`` event). Core checks it and
+           copies the parent's exposure into this agent's session; a refusal
+           returns the uniform refusal and the graph never runs.
+        2. Runs the graph on the task alone, in the parent's scope, so both
+           sides' sessions are the ones Core links.
+        3. Asks Core whether the result may return to the parent
+           (``action_class: handoff_return``) before it leaves. A refusal
+           returns the uniform refusal, never the result.
+
+        Returns :meth:`HandoffResult.to_dict`, for the parent's
+        :func:`~openbox_langgraph.handoff.handoff_tool`.
+        """
+        if _exposure_mod is None:
+            raise OpenBoxConfigError(
+                "receiving a handoff needs openbox-sdk-python with exposure fields"
+            )
+        env = HandoffEnvelope.from_dict(envelope)
+        scope = handoff_scope(env.scope, env.multi_agent_session_id)
+        thread_id = f"handoff-{env.multi_agent_session_id}"
+        cfg = dict(config or {})
+        cfg["configurable"] = {"thread_id": thread_id, **(cfg.get("configurable") or {})}
+        refused = HandoffResult(refused=True).to_dict()
+
+        def payload(event_type: str, activity_type: str, **extra: Any) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                "source": "workflow-telemetry",
+                "event_type": event_type,
+                "workflow_id": thread_id,
+                "run_id": f"{thread_id}-run",
+                "workflow_type": self._config.agent_name or "LangGraphRun",
+                "task_queue": self._config.task_queue,
+                "timestamp": rfc3339_now(),
+                "activity_id": f"{thread_id}-{activity_type}",
+                "activity_type": activity_type,
+                "multi_agent_session_id": env.multi_agent_session_id,
+                **extra,
+            }
+            if self._config.session_id:
+                body["session_id"] = self._config.session_id
+            return body
+
+        stack = enter_scope(scope, force=True)
+        try:
+            handed = await self._client.evaluate_raw(
+                payload("Handoff", "handoff", from_agent_did=env.from_agent_did)
+            )
+            if _core_refused(handed):
+                return refused
+            make_input = input_from_task or _default_handoff_input
+            try:
+                state = await self.ainvoke(make_input(env.task), config=cfg)
+            except (GovernanceBlockedError, GovernanceHaltError, GuardrailsValidationError):
+                return refused
+            result = (result_from_state or _default_handoff_result)(state)
+            parent = _exposure_mod.Participant("agent_session", f"{env.from_agent_id}/{scope}")
+            with _exposure_mod.governed_action("handoff_return", participants=[parent]):
+                returned = await self._client.evaluate_raw(
+                    payload("ActivityStarted", "handoff_return")
+                )
+            if _core_refused(returned):
+                return refused
+            return HandoffResult(result=result).to_dict()
+        finally:
+            exit_scope(stack)
 
     async def _ainvoke_unscoped(
         self,
@@ -1987,6 +2073,33 @@ class OpenBoxLangGraphHandler:
 # ═══════════════════════════════════════════════════════════════════
 # Factory
 # ═══════════════════════════════════════════════════════════════════
+
+def _core_refused(data: dict[str, Any] | None) -> bool:
+    """Whether Core's answer stops a handoff step. ``None`` (Core unreachable
+    under fail-open) follows the client's ``on_api_error``, which already
+    raised if it was fail-closed."""
+    if data is None:
+        return False
+    response = GovernanceVerdictResponse.from_dict(data)
+    try:
+        result = enforce_verdict(response, "tool_start")
+    except (GovernanceBlockedError, GovernanceHaltError, GuardrailsValidationError):
+        return True
+    return result.requires_hitl
+
+
+def _default_handoff_input(task: str) -> dict[str, Any]:
+    return {"messages": [{"role": "user", "content": task}]}
+
+
+def _default_handoff_result(state: dict[str, Any]) -> str:
+    messages = state.get("messages") if isinstance(state, dict) else None
+    if messages:
+        last = messages[-1]
+        content = last.get("content") if isinstance(last, dict) else getattr(last, "content", last)
+        return content if isinstance(content, str) else str(content)
+    return str(state)
+
 
 def create_openbox_graph_handler(
     graph: Any,

@@ -91,11 +91,12 @@ def caller_scope_set() -> bool:
     return _exposure is not None and bool(_exposure.current_exposure_fields().get("scope"))
 
 
-def enter_scope(scope: str | None) -> contextlib.ExitStack:
-    """Enter ``exposure_scope(scope)`` unless there is nothing to do. Close the
-    returned stack with :func:`exit_scope`."""
+def enter_scope(scope: str | None, *, force: bool = False) -> contextlib.ExitStack:
+    """Enter ``exposure_scope(scope)`` unless there is nothing to do, or the
+    caller already scoped the run (``force`` overrides that, for a handoff
+    whose scope is the parent's). Close the stack with :func:`exit_scope`."""
     stack = contextlib.ExitStack()
-    if scope and _exposure is not None and not caller_scope_set():
+    if scope and _exposure is not None and (force or not caller_scope_set()):
         stack.enter_context(_exposure.exposure_scope(scope))
     return stack
 
