@@ -338,6 +338,32 @@ class GuardrailsResult:
     raw_logs: dict[str, Any] | None = None
 
 
+def _withheld_fields(verdict: Verdict, value: Any) -> dict[str, Any]:
+    """``withheld_uris`` / ``withheld_notify_user`` from a response's
+    ``withheld`` object. Only an admission that goes ahead withholds."""
+    if verdict not in (Verdict.ALLOW, Verdict.CONSTRAIN) or not isinstance(value, dict):
+        return {}
+    uris = value.get("uris")
+    if not isinstance(uris, list):
+        return {}
+    clean = tuple(u for u in uris if isinstance(u, str) and u)
+    if not clean:
+        return {}
+    return {"withheld_uris": clean, "withheld_notify_user": value.get("notify_user") is True}
+
+
+def _withheld_from_result(result: EvaluationResult) -> dict[str, Any]:
+    """Read withheld from the base SDK result: its typed field when the
+    installed SDK has one, else the raw body (an older SDK keeps it there)."""
+    verdict = Verdict.from_string(result.verdict.value)
+    typed = getattr(result, "withheld", None)
+    if typed is not None:
+        return _withheld_fields(
+            verdict, {"uris": list(typed.uris), "notify_user": typed.notify_user}
+        )
+    return _withheld_fields(verdict, (result.raw or {}).get("withheld"))
+
+
 @dataclass
 class GovernanceVerdictResponse:
     """Response from governance API evaluation."""
@@ -364,6 +390,11 @@ class GovernanceVerdictResponse:
     fallback_used: bool = False
     diagnostics: list[Any] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Exposure barriers (PROD-1112): the URIs of returned objects an allowed
+    # admission kept out of context, and whether the firm asked for a generic
+    # notice to the user. For the adapter only; never in raw.
+    withheld_uris: tuple[str, ...] = ()
+    withheld_notify_user: bool = False
 
     @property
     def action(self) -> str:
@@ -413,6 +444,7 @@ class GovernanceVerdictResponse:
             alignment_score=data.get("alignment_score"),
             behavioral_violations=data.get("behavioral_violations"),
             constraints=data.get("constraints"),
+            **_withheld_fields(verdict, data.get("withheld")),
         )
 
     @classmethod
@@ -459,7 +491,8 @@ class GovernanceVerdictResponse:
             constraints=result.constraints,
             fallback_used=result.fallback_used,
             diagnostics=list(result.diagnostics),
-            raw=dict(result.raw),
+            raw={k: v for k, v in result.raw.items() if k != "withheld"},
+            **_withheld_from_result(result),
         )
 
     def to_evaluation_result(self) -> EvaluationResult:

@@ -182,3 +182,106 @@ async def test_without_a_label_map_retrievers_are_not_sent() -> None:
     state = await handler.ainvoke({"query": "q"}, config={"configurable": {"thread_id": "t3"}})
     assert state["reached_model"] is True
     assert _admissions(sent) == []
+
+
+# ── PROD-1112: withhold only the walled documents ────────────────
+
+
+def _withholding_client(sent: list[dict], *, notify_user: bool) -> GovernanceClient:
+    """Core double for PROD-1112: an admission is allowed for everything but
+    the client:pepsi documents, which it names as withheld."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.append(body)
+        if body.get("event_type") == "ActivityCompleted" and body.get("resources"):
+            walled = [
+                r["uri"] for r in body["resources"] if "client:pepsi" in (r.get("labels") or [])
+            ]
+            if walled and len(walled) == len(body["resources"]):
+                return httpx.Response(200, json={"verdict": "block", "reason": UNIFORM})
+            if walled:
+                withheld = {"uris": walled, "notify_user": notify_user}
+                return httpx.Response(200, json={"verdict": "allow", "withheld": withheld})
+        return httpx.Response(200, json={"verdict": "allow"})
+
+    client = GovernanceClient(api_url="https://core.test", api_key="obx_test_abc")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client._sync_client = httpx.Client(transport=httpx.MockTransport(handler))
+    return client
+
+
+UNIFORM = "Action blocked by policy"
+MIXED = [
+    Document("coke memo", metadata={"source": "dms://doc/1", "client": "coke"}),
+    Document("pepsi memo, part 1", metadata={"source": "dms://doc/3", "client": "pepsi"}),
+    Document("coke note", metadata={"source": "dms://doc/4", "client": "coke"}),
+    Document("pepsi memo, part 2", metadata={"source": "dms://doc/3", "client": "pepsi"}),
+]
+
+
+@pytest.mark.parametrize("use_async", [True, False], ids=["async-node", "sync-node"])
+async def test_only_the_walled_documents_are_withheld(use_async: bool) -> None:
+    sent: list[dict] = []
+    handler = OpenBoxLangGraphHandler(
+        _graph(_Docs(docs=MIXED), use_async=use_async),
+        OpenBoxLangGraphHandlerOptions(
+            client=_withholding_client(sent, notify_user=False), label_map=LABEL_MAP
+        ),
+    )
+    state = await handler.ainvoke({"query": "q"}, config={"configurable": {"thread_id": "w1"}})
+
+    # Every chunk of the walled document is gone; the rest keep their order.
+    assert state["docs"] == ["coke memo", "coke note"]
+    assert state["reached_model"] is True
+    # Nothing sent after the admission carries the withheld document.
+    after = sent[sent.index(_admissions(sent)[0]) + 1 :]
+    assert "pepsi" not in json.dumps(after)
+
+
+async def test_nothing_left_is_the_uniform_refusal() -> None:
+    sent: list[dict] = []
+    handler = OpenBoxLangGraphHandler(
+        _graph(_Docs(docs=PEPSI), use_async=True),
+        OpenBoxLangGraphHandlerOptions(
+            client=_withholding_client(sent, notify_user=True), label_map=LABEL_MAP
+        ),
+    )
+    with pytest.raises(GovernanceBlockedError) as err:
+        await handler.ainvoke({"query": "q"}, config={"configurable": {"thread_id": "w2"}})
+    assert str(err.value) == UNIFORM
+
+
+@pytest.mark.parametrize("notify_user", [True, False], ids=["firm-on", "firm-off"])
+async def test_host_notice_follows_the_firm_setting(notify_user: bool) -> None:
+    if not hasattr(exposure, "withheld_notice"):
+        pytest.skip("openbox-sdk-python without the withheld notice")
+    seen: list[str] = []
+    sent: list[dict] = []
+    handler = OpenBoxLangGraphHandler(
+        _graph(_Docs(docs=MIXED), use_async=True),
+        OpenBoxLangGraphHandlerOptions(
+            client=_withholding_client(sent, notify_user=notify_user), label_map=LABEL_MAP
+        ),
+    )
+    with exposure.withheld_notice(seen.append):
+        state = await handler.ainvoke(
+            {"query": "q"}, config={"configurable": {"thread_id": f"w3-{notify_user}"}}
+        )
+    assert state["docs"] == ["coke memo", "coke note"]
+    assert seen == ([exposure.WITHHELD_NOTICE] if notify_user else [])
+    # The notice is for the host: it is never in the graph's state.
+    assert exposure.WITHHELD_NOTICE not in json.dumps(state)
+
+
+def test_withheld_is_never_in_raw() -> None:
+    from openbox_langgraph.types import GovernanceVerdictResponse
+
+    r = GovernanceVerdictResponse.from_dict(
+        {"verdict": "allow", "withheld": {"uris": ["dms://doc/3"], "notify_user": True}}
+    )
+    assert r.withheld_uris == ("dms://doc/3",) and r.withheld_notify_user is True
+    blocked = GovernanceVerdictResponse.from_dict(
+        {"verdict": "block", "withheld": {"uris": ["dms://doc/3"]}}
+    )
+    assert blocked.withheld_uris == ()

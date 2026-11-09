@@ -14,6 +14,13 @@ the documents never reach the tool, the model or the graph state. The
 refusal is the same one any block raises: it does not say which document or
 label caused it.
 
+When only some documents are walled, Core admits the rest and names the
+withheld ones (PROD-1112). ``withhold_documents`` removes those from the
+retriever's result before it returns, so the agent gets only what it is
+entitled to and is not told anything was withheld. When the firm turned the
+notice on, the host application gets a generic notice through
+``openbox_core.on_withheld_notice``; the model never does.
+
 A document with no mapped label is still sent, unlabelled. Core treats it as
 Unknown: shadow mode records it, enforce mode refuses it. ``LabelCoverage``
 counts how many documents each retriever labels, which is the label coverage
@@ -249,3 +256,36 @@ class RetrieverAdmissionCallback(BaseCallbackHandler):
             raise GovernanceBlockedError(
                 response.reason or UNIFORM_REFUSAL, response.policy_id, response.risk_score
             )
+        if response.withheld_uris:
+            withhold_documents(
+                documents, set(response.withheld_uris), retriever=name, uri_keys=self._uri_keys
+            )
+            notify = getattr(_exposure, "notify_withheld", None)
+            if notify is not None:
+                notify(response.withheld_notify_user)
+
+
+def withhold_documents(
+    documents: Sequence[Any],
+    withheld: set[str],
+    *,
+    retriever: str,
+    uri_keys: Sequence[str] = DEFAULT_URI_KEYS,
+) -> None:
+    """Remove the withheld documents from a retriever's result, in place,
+    before the retriever returns it (PROD-1112).
+
+    Core allowed the retrieval for the other documents only. Every chunk
+    whose URI was withheld goes; the rest keep their order. The agent is not
+    told: what it receives looks like any search that found fewer results.
+    When nothing is left, or the result cannot be changed in place, the
+    retrieval is refused with the uniform refusal instead, so a withheld
+    document can never reach the graph.
+    """
+    uris = [document_uri(d, i, retriever, uri_keys) for i, d in enumerate(documents)]
+    keep = [d for d, uri in zip(documents, uris, strict=True) if uri not in withheld]
+    if len(keep) == len(uris):
+        return
+    if not keep or not isinstance(documents, list):
+        raise GovernanceBlockedError(UNIFORM_REFUSAL, None, 0.0)
+    documents[:] = keep
