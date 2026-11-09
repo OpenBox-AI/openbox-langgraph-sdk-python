@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import dataclass
@@ -565,6 +566,50 @@ class GovernanceClient:
 
         except Exception:
             return None
+
+    def _handoff_recorder(self, name: str) -> Any:
+        """The base SDK's source-authenticated handoff call, when this client
+        can prove its source and the SDK sends the barrier fields."""
+        if self._core_client is None:
+            return None
+        fn = getattr(self._core_client, name, None)
+        if fn is None or "multi_agent_session_id" not in inspect.signature(fn).parameters:
+            return None
+        return fn
+
+    def record_handoff(
+        self, target_agent_id: str, *, multi_agent_session_id: str, scope: str | None = None
+    ) -> dict[str, Any] | None:
+        """Record a handoff from this agent to ``target_agent_id`` with Core
+        (``POST /handoffs``), which runs the exposure-barrier check on it
+        (PROD-1117). Returns Core's answer (``verdict`` "allow" or "block"),
+        or ``None`` when this client cannot record one (no identity, or an
+        openbox-sdk-python without the fields). Errors raise."""
+        fn = self._handoff_recorder("emit_handoff")
+        if fn is None:
+            return None
+        try:
+            answer = fn(target_agent_id, multi_agent_session_id=multi_agent_session_id, scope=scope)
+            return dict(answer)
+        except (_CoreOpenBoxConfigError, _CoreGovernanceAPIError) as exc:
+            _raise_core_error(exc)
+        return None
+
+    async def arecord_handoff(
+        self, target_agent_id: str, *, multi_agent_session_id: str, scope: str | None = None
+    ) -> dict[str, Any] | None:
+        """Async :meth:`record_handoff`."""
+        fn = self._handoff_recorder("aemit_handoff")
+        if fn is None:
+            return None
+        try:
+            answer = await fn(
+                target_agent_id, multi_agent_session_id=multi_agent_session_id, scope=scope
+            )
+            return dict(answer)
+        except (_CoreOpenBoxConfigError, _CoreGovernanceAPIError) as exc:
+            _raise_core_error(exc)
+        return None
 
     async def evaluate_raw(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         """Send a pre-built payload to the governance evaluate endpoint.
