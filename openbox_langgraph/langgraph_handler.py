@@ -15,7 +15,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -48,9 +48,18 @@ from openbox_langgraph.errors import (
     GovernanceBlockedError,
     GovernanceHaltError,
     GuardrailsValidationError,
+    OpenBoxConfigError,
     _raise_core_error,
 )
+from openbox_langgraph.handoff import HandoffEnvelope, HandoffResult, handoff_scope
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
+from openbox_langgraph.retriever_labels import (
+    DEFAULT_URI_KEYS,
+    LabelCoverage,
+    RetrieverAdmissionCallback,
+    exposure_available,
+)
+from openbox_langgraph.run_scope import ScopeResolver, enter_scope, exit_scope, resolve_run_scope
 from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope, turn_metadata
 from openbox_langgraph.types import (
     GovernanceVerdictResponse,
@@ -65,6 +74,11 @@ from openbox_langgraph.verdict_handler import (
 )
 
 _logger = logging.getLogger(__name__)
+
+try:
+    from openbox_core import exposure as _exposure_mod  # type: ignore[attr-defined,unused-ignore]
+except ImportError:  # openbox-sdk-python before exposure fields
+    _exposure_mod = None  # type: ignore[assignment,unused-ignore]
 
 _otel_tracer = otel_trace.get_tracer("openbox-langgraph")
 
@@ -248,6 +262,32 @@ class OpenBoxLangGraphHandlerOptions:
 
         tool_type_map={"search_web": "http", "query_db": "database"}
     """
+    label_map: dict[str, str] | None = None
+    """Exposure-barrier labels from retrieved documents (PROD-1109): document
+    metadata key -> label namespace.
+
+    With ``{"client": "client", "matter_id": "matter"}``, a document whose
+    metadata has ``client="coke"`` is sent to Core as ``client:coke``. Every
+    retrieval's documents then go through Core's admission gate before the
+    retriever returns; a refusal raises and the documents are dropped. Needs an
+    openbox-sdk-python with exposure fields. Unset: retrievers are not labelled.
+    """
+    label_uri_keys: tuple[str, ...] = DEFAULT_URI_KEYS
+    """Metadata keys tried, in order, for a retrieved document's URI."""
+    label_coverage_log_every: int = 100
+    """Log labelled vs unlabelled document counts every N documents (0: never).
+    The counts are also on ``handler.label_coverage.snapshot()``."""
+    scope_key: str | None = None
+    """One agent session per matter or tenant (PROD-1109): the run input key
+    holding it, e.g. ``"matter_id"``. Looked up in the input, then in
+    ``config["configurable"]``, then in the thread's saved state. The value
+    becomes ``<namespace>:<value>``; core keeps one exposure history per scope.
+    Unset: each run is its own session."""
+    scope_namespace: str | None = None
+    """Namespace for ``scope_key`` values; defaults to the key without ``_id``
+    (``matter_id`` -> ``matter``)."""
+    scope_resolver: ScopeResolver | None = None
+    """Custom ``(input, config) -> scope``; takes precedence over ``scope_key``."""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -308,6 +348,18 @@ class OpenBoxLangGraphHandler:
         # external subclass touching it degrades gracefully rather than
         # AttributeError-ing.
         self._span_processor = None
+
+        self._label_map: dict[str, str] = dict(opts.label_map or {})
+        self._label_uri_keys = tuple(opts.label_uri_keys)
+        self.label_coverage = LabelCoverage(opts.label_coverage_log_every)
+        self._scope_key = opts.scope_key
+        self._scope_namespace = opts.scope_namespace
+        self._scope_resolver = opts.scope_resolver
+        if self._label_map and not exposure_available():
+            _logger.warning(
+                "OpenBox: label_map is set but openbox-sdk-python has no exposure fields; "
+                "retrieved documents will not be labelled"
+            )
 
         # Ownership channel for the pure-LangChain-Core callback (C1). Created
         # ONLY under the exact same condition the callback is installed and the
@@ -740,6 +792,20 @@ class OpenBoxLangGraphHandler:
             )
             callbacks.append(OpenBoxLangChainCoreAsyncCallbackHandler(callback_options))
             callbacks.append(OpenBoxLangChainCoreSyncCallbackHandler(callback_options))
+        if self._label_map and exposure_available():
+            callbacks.append(
+                RetrieverAdmissionCallback(
+                    client=self._client,
+                    label_map=self._label_map,
+                    uri_keys=self._label_uri_keys,
+                    coverage=self.label_coverage,
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    workflow_type=self._config.agent_name or "LangGraphRun",
+                    task_queue=self._config.task_queue,
+                    session_id=self._config.session_id,
+                )
+            )
         cfg = dict(config or {})
         cfg["callbacks"] = [*list(cfg.get("callbacks") or []), *callbacks]
         # Carry this turn's ids to the wrapped tools via their own RunnableConfig
@@ -753,7 +819,185 @@ class OpenBoxLangGraphHandler:
     # Public invoke / ainvoke
     # ─────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────
+    # Run scope: one agent session per matter or tenant (PROD-1109)
+    # ─────────────────────────────────────────────────────────────
+
+    async def _enter_run_scope(
+        self, input: Any, config: dict[str, Any] | None
+    ) -> contextlib.ExitStack:
+        scope = await resolve_run_scope(
+            self._graph,
+            input,
+            config,
+            key=self._scope_key,
+            namespace=self._scope_namespace,
+            resolver=self._scope_resolver,
+        )
+        return enter_scope(scope)
+
     async def ainvoke(
+        self,
+        input: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Invoke the governed graph and return the final state.
+
+        Every governance event of the run is scoped to the run's matter or
+        tenant when ``scope_key``/``scope_resolver`` is set.
+        """
+        scope = await self._enter_run_scope(input, config)
+        try:
+            return await self._ainvoke_unscoped(input, config=config, **kwargs)
+        finally:
+            exit_scope(scope)
+
+    async def astream_governed(
+        self,
+        input: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream governed graph events, scoped like :meth:`ainvoke`."""
+        scope = await self._enter_run_scope(input, config)
+        try:
+            inner = cast(
+                "AsyncGenerator[dict[str, Any], None]",
+                self._astream_governed_unscoped(input, config=config, **kwargs),
+            )
+            async with contextlib.aclosing(inner) as events:
+                async for event in events:
+                    yield event
+        finally:
+            exit_scope(scope)
+
+    async def astream_events(
+        self,
+        input: dict[str, Any],
+        config: dict[str, Any] | None = None,
+        *,
+        version: str = "v2",
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Graph-compatible astream_events, scoped like :meth:`ainvoke`."""
+        scope = await self._enter_run_scope(input, config)
+        try:
+            inner = cast(
+                "AsyncGenerator[dict[str, Any], None]",
+                self._astream_events_unscoped(input, config, version=version, **kwargs),
+            )
+            async with contextlib.aclosing(inner) as events:
+                async for event in events:
+                    yield event
+        finally:
+            exit_scope(scope)
+
+    # ─────────────────────────────────────────────────────────────
+    # Receiving a handoff from another governed agent (PROD-1109)
+    # ─────────────────────────────────────────────────────────────
+
+    async def areceive_handoff(
+        self,
+        envelope: Mapping[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        input_from_task: Callable[[str], dict[str, Any]] | None = None,
+        result_from_state: Callable[[dict[str, Any]], str] | None = None,
+    ) -> dict[str, Any]:
+        """Run this graph on a task another governed agent handed over.
+
+        1. Records the handoff with Core (``Handoff`` event). Core checks it and
+           copies the parent's exposure into this agent's session; a refusal
+           returns the uniform refusal and the graph never runs.
+        2. Runs the graph on the task alone, in the parent's scope, so both
+           sides' sessions are the ones Core links.
+        3. Asks Core whether the result may return to the parent
+           (``action_class: handoff_return``) before it leaves. A refusal
+           returns the uniform refusal, never the result.
+
+        Returns :meth:`HandoffResult.to_dict`, for the parent's
+        :func:`~openbox_langgraph.handoff.handoff_tool`.
+        """
+        if _exposure_mod is None:
+            raise OpenBoxConfigError(
+                "receiving a handoff needs openbox-sdk-python with exposure fields"
+            )
+        env = HandoffEnvelope.from_dict(envelope)
+        scope = handoff_scope(env.scope, env.multi_agent_session_id)
+        thread_id = f"handoff-{env.multi_agent_session_id}"
+        # Core opens a session on WorkflowStarted and seals the workflow on
+        # WorkflowCompleted, so every handoff gets its own workflow id.
+        workflow_id = f"{thread_id}-{uuid.uuid4().hex[:8]}"
+        run_id = f"{workflow_id}-run"
+        cfg = dict(config or {})
+        cfg["configurable"] = {"thread_id": thread_id, **(cfg.get("configurable") or {})}
+        refused = HandoffResult(refused=True).to_dict()
+        agent = self._config.agent_name or "LangGraphRun"
+
+        def payload(
+            event_type: str, activity_id: str, activity_type: str, **extra: Any
+        ) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                "source": "workflow-telemetry",
+                "event_type": event_type,
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "workflow_type": agent,
+                "task_queue": self._config.task_queue,
+                "timestamp": rfc3339_now(),
+                "activity_id": activity_id,
+                "activity_type": activity_type,
+                "multi_agent_session_id": env.multi_agent_session_id,
+                **extra,
+            }
+            if self._config.session_id:
+                body["session_id"] = self._config.session_id
+            return body
+
+        stack = enter_scope(scope, force=True)
+        outcome = "failed"
+        try:
+            await self._client.evaluate_raw(
+                payload(
+                    "WorkflowStarted", f"{run_id}-wf", agent, activity_input=[{"task": env.task}]
+                )
+            )
+            try:
+                handed = await self._client.evaluate_raw(
+                    payload("Handoff", f"{run_id}-handoff", "handoff",
+                            from_agent_did=env.from_agent_did)
+                )
+                if _core_refused(handed):
+                    return refused
+                make_input = input_from_task or _default_handoff_input
+                try:
+                    state = await self.ainvoke(make_input(env.task), config=cfg)
+                except (GovernanceBlockedError, GovernanceHaltError, GuardrailsValidationError):
+                    return refused
+                result = (result_from_state or _default_handoff_result)(state)
+                parent = _exposure_mod.Participant("agent_session", f"{env.from_agent_id}/{scope}")
+                with _exposure_mod.governed_action("handoff_return", participants=[parent]):
+                    returned = await self._client.evaluate_raw(
+                        payload("ActivityStarted", f"{run_id}-return", "handoff_return")
+                    )
+                if _core_refused(returned):
+                    return refused
+                outcome = "completed"
+                return HandoffResult(result=result).to_dict()
+            finally:
+                try:
+                    await self._client.evaluate_raw(
+                        payload("WorkflowCompleted", f"{run_id}-wf", agent, status=outcome)
+                    )
+                except Exception:  # closing telemetry must not replace the answer
+                    _logger.warning("OpenBox: could not close handoff workflow %s", workflow_id)
+        finally:
+            exit_scope(stack)
+
+    async def _ainvoke_unscoped(
         self,
         input: dict[str, Any],
         *,
@@ -830,7 +1074,7 @@ class OpenBoxLangGraphHandler:
 
         return final_output
 
-    async def astream_governed(
+    async def _astream_governed_unscoped(
         self,
         input: dict[str, Any],
         *,
@@ -929,7 +1173,7 @@ class OpenBoxLangGraphHandler:
             async for chunk in inner:
                 yield chunk
 
-    async def astream_events(
+    async def _astream_events_unscoped(
         self,
         input: dict[str, Any],
         config: dict[str, Any] | None = None,
@@ -1852,6 +2096,33 @@ class OpenBoxLangGraphHandler:
 # ═══════════════════════════════════════════════════════════════════
 # Factory
 # ═══════════════════════════════════════════════════════════════════
+
+def _core_refused(data: dict[str, Any] | None) -> bool:
+    """Whether Core's answer stops a handoff step. ``None`` (Core unreachable
+    under fail-open) follows the client's ``on_api_error``, which already
+    raised if it was fail-closed."""
+    if data is None:
+        return False
+    response = GovernanceVerdictResponse.from_dict(data)
+    try:
+        result = enforce_verdict(response, "tool_start")
+    except (GovernanceBlockedError, GovernanceHaltError, GuardrailsValidationError):
+        return True
+    return result.requires_hitl
+
+
+def _default_handoff_input(task: str) -> dict[str, Any]:
+    return {"messages": [{"role": "user", "content": task}]}
+
+
+def _default_handoff_result(state: dict[str, Any]) -> str:
+    messages = state.get("messages") if isinstance(state, dict) else None
+    if messages:
+        last = messages[-1]
+        content = last.get("content") if isinstance(last, dict) else getattr(last, "content", last)
+        return content if isinstance(content, str) else str(content)
+    return str(state)
+
 
 def create_openbox_graph_handler(
     graph: Any,
