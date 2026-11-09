@@ -51,6 +51,12 @@ from openbox_langgraph.errors import (
     _raise_core_error,
 )
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
+from openbox_langgraph.retriever_labels import (
+    DEFAULT_URI_KEYS,
+    LabelCoverage,
+    RetrieverAdmissionCallback,
+    exposure_available,
+)
 from openbox_langgraph.tool_activity_binding import bind_tools_activity_scope, turn_metadata
 from openbox_langgraph.types import (
     GovernanceVerdictResponse,
@@ -248,6 +254,21 @@ class OpenBoxLangGraphHandlerOptions:
 
         tool_type_map={"search_web": "http", "query_db": "database"}
     """
+    label_map: dict[str, str] | None = None
+    """Exposure-barrier labels from retrieved documents (PROD-1109): document
+    metadata key -> label namespace.
+
+    With ``{"client": "client", "matter_id": "matter"}``, a document whose
+    metadata has ``client="coke"`` is sent to Core as ``client:coke``. Every
+    retrieval's documents then go through Core's admission gate before the
+    retriever returns; a refusal raises and the documents are dropped. Needs an
+    openbox-sdk-python with exposure fields. Unset: retrievers are not labelled.
+    """
+    label_uri_keys: tuple[str, ...] = DEFAULT_URI_KEYS
+    """Metadata keys tried, in order, for a retrieved document's URI."""
+    label_coverage_log_every: int = 100
+    """Log labelled vs unlabelled document counts every N documents (0: never).
+    The counts are also on ``handler.label_coverage.snapshot()``."""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -308,6 +329,15 @@ class OpenBoxLangGraphHandler:
         # external subclass touching it degrades gracefully rather than
         # AttributeError-ing.
         self._span_processor = None
+
+        self._label_map: dict[str, str] = dict(opts.label_map or {})
+        self._label_uri_keys = tuple(opts.label_uri_keys)
+        self.label_coverage = LabelCoverage(opts.label_coverage_log_every)
+        if self._label_map and not exposure_available():
+            _logger.warning(
+                "OpenBox: label_map is set but openbox-sdk-python has no exposure fields; "
+                "retrieved documents will not be labelled"
+            )
 
         # Ownership channel for the pure-LangChain-Core callback (C1). Created
         # ONLY under the exact same condition the callback is installed and the
@@ -740,6 +770,20 @@ class OpenBoxLangGraphHandler:
             )
             callbacks.append(OpenBoxLangChainCoreAsyncCallbackHandler(callback_options))
             callbacks.append(OpenBoxLangChainCoreSyncCallbackHandler(callback_options))
+        if self._label_map and exposure_available():
+            callbacks.append(
+                RetrieverAdmissionCallback(
+                    client=self._client,
+                    label_map=self._label_map,
+                    uri_keys=self._label_uri_keys,
+                    coverage=self.label_coverage,
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    workflow_type=self._config.agent_name or "LangGraphRun",
+                    task_queue=self._config.task_queue,
+                    session_id=self._config.session_id,
+                )
+            )
         cfg = dict(config or {})
         cfg["callbacks"] = [*list(cfg.get("callbacks") or []), *callbacks]
         # Carry this turn's ids to the wrapped tools via their own RunnableConfig
