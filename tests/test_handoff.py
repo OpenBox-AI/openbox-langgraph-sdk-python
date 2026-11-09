@@ -157,17 +157,22 @@ async def test_the_child_records_runs_on_the_task_alone_and_checks_the_return() 
     reply = await _child(sent, seen).areceive_handoff(_envelope())
 
     assert reply == {"result": "answer: find the memo"}
-    # Recorded first, with who handed it over.
-    assert _is(sent[0], "Handoff")
-    assert sent[0]["from_agent_did"] == "did:openbox:parent"
-    assert sent[0]["multi_agent_session_id"] == "mas-1"
+    # The handoff runs in its own workflow, so Core has a session for it.
+    assert sent[0]["event_type"] == "WorkflowStarted"
+    wf = sent[0]["workflow_id"]
+    # Recorded before any work, with who handed it over.
+    assert _is(sent[1], "Handoff") and sent[1]["workflow_id"] == wf
+    assert sent[1]["from_agent_did"] == "did:openbox:parent"
+    assert sent[1]["multi_agent_session_id"] == "mas-1"
     # The graph saw the task and nothing else.
     assert len(seen) == 1 and [m.content for m in seen[0]] == ["find the memo"]
-    # The return is checked last, naming the parent's session.
-    assert _is(sent[-1], "handoff_return")
-    assert sent[-1]["participants"] == [
+    # The return is checked last, in the handoff's workflow, naming the parent.
+    assert _is(sent[-2], "handoff_return") and sent[-2]["workflow_id"] == wf
+    assert sent[-2]["participants"] == [
         {"kind": "agent_session", "id": "agent-parent/matter:0417"}
     ]
+    assert sent[-1]["event_type"] == "WorkflowCompleted" and sent[-1]["workflow_id"] == wf
+    assert sent[-1]["status"] == "completed"
     # Every event of the child is in the parent's scope.
     assert {b.get("scope") for b in sent} == {"matter:0417"}
     assert "scope" not in exposure.current_exposure_fields()
@@ -179,7 +184,9 @@ async def test_a_refused_handoff_never_runs_the_graph() -> None:
     child = _child(sent, seen, block=lambda b: _is(b, "Handoff"))
     reply = await child.areceive_handoff(_envelope())
     assert reply == {"refused": True, "reason": UNIFORM_REFUSAL}
-    assert seen == [] and len(sent) == 1
+    assert seen == []
+    assert [b["event_type"] for b in sent] == ["WorkflowStarted", "Handoff", "WorkflowCompleted"]
+    assert sent[-1]["status"] == "failed"
 
 
 async def test_a_refused_return_never_sends_the_result() -> None:
@@ -190,13 +197,24 @@ async def test_a_refused_return_never_sends_the_result() -> None:
     )
     assert reply == {"refused": True, "reason": UNIFORM_REFUSAL}
     assert "answer" not in json.dumps(reply)
+    assert sent[-1]["event_type"] == "WorkflowCompleted" and sent[-1]["status"] == "failed"
 
 
 async def test_without_a_scope_both_sides_use_the_multi_agent_session() -> None:
     sent: list[dict] = []
     await _child(sent, []).areceive_handoff(_envelope(scope=None))
     assert {b.get("scope") for b in sent} == {"mas:mas-1"}
-    assert sent[-1]["participants"] == [{"kind": "agent_session", "id": "agent-parent/mas:mas-1"}]
+    assert sent[-2]["participants"] == [{"kind": "agent_session", "id": "agent-parent/mas:mas-1"}]
+
+
+async def test_each_handoff_gets_its_own_workflow() -> None:
+    # Core seals a workflow on WorkflowCompleted; reusing its id would HALT.
+    sent: list[dict] = []
+    child = _child(sent, [])
+    await child.areceive_handoff(_envelope())
+    await child.areceive_handoff(_envelope())
+    handoffs = [b["workflow_id"] for b in sent if b["event_type"] == "Handoff"]
+    assert len(handoffs) == 2 and handoffs[0] != handoffs[1]
 
 
 async def test_a_block_inside_the_child_comes_back_as_the_uniform_refusal() -> None:

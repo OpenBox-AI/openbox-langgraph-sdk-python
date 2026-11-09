@@ -928,20 +928,27 @@ class OpenBoxLangGraphHandler:
         env = HandoffEnvelope.from_dict(envelope)
         scope = handoff_scope(env.scope, env.multi_agent_session_id)
         thread_id = f"handoff-{env.multi_agent_session_id}"
+        # Core opens a session on WorkflowStarted and seals the workflow on
+        # WorkflowCompleted, so every handoff gets its own workflow id.
+        workflow_id = f"{thread_id}-{uuid.uuid4().hex[:8]}"
+        run_id = f"{workflow_id}-run"
         cfg = dict(config or {})
         cfg["configurable"] = {"thread_id": thread_id, **(cfg.get("configurable") or {})}
         refused = HandoffResult(refused=True).to_dict()
+        agent = self._config.agent_name or "LangGraphRun"
 
-        def payload(event_type: str, activity_type: str, **extra: Any) -> dict[str, Any]:
+        def payload(
+            event_type: str, activity_id: str, activity_type: str, **extra: Any
+        ) -> dict[str, Any]:
             body: dict[str, Any] = {
                 "source": "workflow-telemetry",
                 "event_type": event_type,
-                "workflow_id": thread_id,
-                "run_id": f"{thread_id}-run",
-                "workflow_type": self._config.agent_name or "LangGraphRun",
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "workflow_type": agent,
                 "task_queue": self._config.task_queue,
                 "timestamp": rfc3339_now(),
-                "activity_id": f"{thread_id}-{activity_type}",
+                "activity_id": activity_id,
                 "activity_type": activity_type,
                 "multi_agent_session_id": env.multi_agent_session_id,
                 **extra,
@@ -951,26 +958,42 @@ class OpenBoxLangGraphHandler:
             return body
 
         stack = enter_scope(scope, force=True)
+        outcome = "failed"
         try:
-            handed = await self._client.evaluate_raw(
-                payload("Handoff", "handoff", from_agent_did=env.from_agent_did)
-            )
-            if _core_refused(handed):
-                return refused
-            make_input = input_from_task or _default_handoff_input
-            try:
-                state = await self.ainvoke(make_input(env.task), config=cfg)
-            except (GovernanceBlockedError, GovernanceHaltError, GuardrailsValidationError):
-                return refused
-            result = (result_from_state or _default_handoff_result)(state)
-            parent = _exposure_mod.Participant("agent_session", f"{env.from_agent_id}/{scope}")
-            with _exposure_mod.governed_action("handoff_return", participants=[parent]):
-                returned = await self._client.evaluate_raw(
-                    payload("ActivityStarted", "handoff_return")
+            await self._client.evaluate_raw(
+                payload(
+                    "WorkflowStarted", f"{run_id}-wf", agent, activity_input=[{"task": env.task}]
                 )
-            if _core_refused(returned):
-                return refused
-            return HandoffResult(result=result).to_dict()
+            )
+            try:
+                handed = await self._client.evaluate_raw(
+                    payload("Handoff", f"{run_id}-handoff", "handoff",
+                            from_agent_did=env.from_agent_did)
+                )
+                if _core_refused(handed):
+                    return refused
+                make_input = input_from_task or _default_handoff_input
+                try:
+                    state = await self.ainvoke(make_input(env.task), config=cfg)
+                except (GovernanceBlockedError, GovernanceHaltError, GuardrailsValidationError):
+                    return refused
+                result = (result_from_state or _default_handoff_result)(state)
+                parent = _exposure_mod.Participant("agent_session", f"{env.from_agent_id}/{scope}")
+                with _exposure_mod.governed_action("handoff_return", participants=[parent]):
+                    returned = await self._client.evaluate_raw(
+                        payload("ActivityStarted", f"{run_id}-return", "handoff_return")
+                    )
+                if _core_refused(returned):
+                    return refused
+                outcome = "completed"
+                return HandoffResult(result=result).to_dict()
+            finally:
+                try:
+                    await self._client.evaluate_raw(
+                        payload("WorkflowCompleted", f"{run_id}-wf", agent, status=outcome)
+                    )
+                except Exception:  # closing telemetry must not replace the answer
+                    _logger.warning("OpenBox: could not close handoff workflow %s", workflow_id)
         finally:
             exit_scope(stack)
 
