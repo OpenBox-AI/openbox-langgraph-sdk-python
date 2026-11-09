@@ -19,6 +19,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from langchain_core.tools import BaseTool
 from openbox_core.errors import OpenBoxConfigError as _CoreOpenBoxConfigError
 from openbox_langchain import (
     ActivityBridge,
@@ -52,6 +53,7 @@ from openbox_langgraph.errors import (
     _raise_core_error,
 )
 from openbox_langgraph.handoff import HandoffEnvelope, HandoffResult, handoff_scope
+from openbox_langgraph.handoff import handoff_tool as _handoff_tool
 from openbox_langgraph.hitl import HITLPollParams, poll_until_decision
 from openbox_langgraph.retriever_labels import (
     DEFAULT_URI_KEYS,
@@ -966,12 +968,15 @@ class OpenBoxLangGraphHandler:
                 )
             )
             try:
-                handed = await self._client.evaluate_raw(
-                    payload("Handoff", f"{run_id}-handoff", "handoff",
-                            from_agent_did=env.from_agent_did)
-                )
-                if _core_refused(handed):
-                    return refused
+                if not env.recorded:
+                    # The parent could not record the handoff itself; record
+                    # it with the legacy receiver-authenticated event.
+                    handed = await self._client.evaluate_raw(
+                        payload("Handoff", f"{run_id}-handoff", "handoff",
+                                from_agent_did=env.from_agent_did)
+                    )
+                    if _core_refused(handed):
+                        return refused
                 make_input = input_from_task or _default_handoff_input
                 try:
                     state = await self.ainvoke(make_input(env.task), config=cfg)
@@ -996,6 +1001,11 @@ class OpenBoxLangGraphHandler:
                     _logger.warning("OpenBox: could not close handoff workflow %s", workflow_id)
         finally:
             exit_scope(stack)
+
+    def handoff_tool(self, **kwargs: Any) -> BaseTool:
+        """:func:`~openbox_langgraph.handoff.handoff_tool` that records each
+        handoff with Core through this handler's client (PROD-1117)."""
+        return _handoff_tool(client=self._client, **kwargs)
 
     async def _ainvoke_unscoped(
         self,

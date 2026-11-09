@@ -168,9 +168,7 @@ async def test_the_child_records_runs_on_the_task_alone_and_checks_the_return() 
     assert len(seen) == 1 and [m.content for m in seen[0]] == ["find the memo"]
     # The return is checked last, in the handoff's workflow, naming the parent.
     assert _is(sent[-2], "handoff_return") and sent[-2]["workflow_id"] == wf
-    assert sent[-2]["participants"] == [
-        {"kind": "agent_session", "id": "agent-parent/matter:0417"}
-    ]
+    assert sent[-2]["participants"] == [{"kind": "agent_session", "id": "agent-parent/matter:0417"}]
     assert sent[-1]["event_type"] == "WorkflowCompleted" and sent[-1]["workflow_id"] == wf
     assert sent[-1]["status"] == "completed"
     # Every event of the child is in the parent's scope.
@@ -247,3 +245,98 @@ async def test_parent_to_child_and_back(block_return: bool) -> None:
     with exposure.exposure_scope("matter:0417"):
         out = await tool.ainvoke({"task": "find the memo"})
     assert out == (UNIFORM_REFUSAL if block_return else "answer: find the memo")
+
+
+# ── PROD-1117: the parent records the handoff through POST /handoffs ─────
+
+
+class _Recorder:
+    """Stands in for GovernanceClient.arecord_handoff / record_handoff."""
+
+    def __init__(self, answer: Any = None, error: Exception | None = None) -> None:
+        self.answer, self.error, self.calls = answer, error, []
+
+    async def arecord_handoff(self, target: str, **kw: Any) -> Any:
+        return self.record_handoff(target, **kw)
+
+    def record_handoff(self, target: str, **kw: Any) -> Any:
+        self.calls.append((target, kw))
+        if self.error:
+            raise self.error
+        return self.answer
+
+
+def _recording_tool(send: Callable[[dict[str, Any]], Any], recorder: _Recorder) -> Any:
+    return handoff_tool(
+        name="ask_research",
+        description="d",
+        target_agent_id="agent-child",
+        send=send,
+        from_agent_id="agent-parent",
+        multi_agent_session_id="mas-1",
+        client=recorder,
+    )
+
+
+async def test_a_recorded_handoff_is_marked_and_needs_no_did() -> None:
+    sent: list[dict[str, Any]] = []
+    recorder = _Recorder({"handoff_id": "h1", "verdict": "allow"})
+
+    async def send(env: dict[str, Any]) -> dict[str, Any]:
+        sent.append(env)
+        return {"result": "ok"}
+
+    with exposure.exposure_scope("matter:0417"):
+        assert await _recording_tool(send, recorder).ainvoke({"task": "t"}) == "ok"
+    assert recorder.calls == [
+        ("agent-child", {"multi_agent_session_id": "mas-1", "scope": "matter:0417"})
+    ]
+    gov = sent[0][HANDOFF_KEY]
+    assert gov["recorded"] is True and "from_agent_did" not in gov
+    assert HandoffEnvelope.from_dict(sent[0]).recorded
+
+
+@pytest.mark.parametrize(
+    "recorder",
+    [
+        _Recorder({"verdict": "block", "reason": "Action blocked by policy"}),
+        _Recorder(error=RuntimeError("down")),
+    ],
+    ids=["refused", "recording-failed"],
+)
+async def test_a_refused_or_failed_recording_sends_nothing(recorder: _Recorder) -> None:
+    sent: list[dict[str, Any]] = []
+    out = await _recording_tool(lambda env: sent.append(env), recorder).ainvoke({"task": "t"})
+    assert out == UNIFORM_REFUSAL and sent == []
+
+
+def test_a_client_that_cannot_record_falls_back_to_the_legacy_event() -> None:
+    sent: list[dict[str, Any]] = []
+    tool = handoff_tool(
+        name="h",
+        description="d",
+        target_agent_id="agent-child",
+        send=lambda env: (sent.append(env), {"result": "ok"})[1],
+        from_agent_id="agent-parent",
+        from_agent_did="did:openbox:parent",
+        client=_Recorder(None),
+    )
+    assert tool.invoke({"task": "t"}) == "ok"
+    gov = sent[0][HANDOFF_KEY]
+    assert "recorded" not in gov and gov["from_agent_did"] == "did:openbox:parent"
+
+
+async def test_the_child_skips_the_legacy_event_for_a_recorded_handoff() -> None:
+    sent: list[dict] = []
+    env = HandoffEnvelope(
+        "find the memo", "mas-1", None, "agent-parent", "matter:0417", recorded=True
+    )
+    reply = await _child(sent, []).areceive_handoff(env.to_dict())
+    assert reply == {"result": "answer: find the memo"}
+    assert not any(b.get("event_type") == "Handoff" for b in sent)
+    assert _is(sent[-2], "handoff_return")
+
+
+async def test_governance_client_without_an_identity_cannot_record() -> None:
+    assert await _core([]).arecord_handoff("agent-child", multi_agent_session_id="m") is None
+    assert _core([]).record_handoff("agent-child", multi_agent_session_id="m") is None
